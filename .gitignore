@@ -1,0 +1,17 @@
+/plot_gonzalez
+/data
+/milestones_analysis
+/scripts
+/most_updated_scripts
+/output
+/*.venv
+/__pycache__
+/.vscode
+/census_data
+/.DS_Store
+*.ipynb_checkpoints
+*.csv
+*.xlsx
+*.json
+
+

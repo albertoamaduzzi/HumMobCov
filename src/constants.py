@@ -1,0 +1,197 @@
+"""
+constants.py
+============
+All project-wide constants and path definitions for the HumMobCov analysis.
+
+Paths use pathlib.Path and are anchored to PROJECT_ROOT so the project
+is portable.  Paths that point to external server storage (raw Cuebiq data,
+legacy output directories) are defined separately and can be overridden
+via environment variables or a local config file if needed.
+"""
+
+import datetime
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Project layout  (HumMobCov/)
+# ---------------------------------------------------------------------------
+PROJECT_ROOT   = Path(__file__).resolve().parent.parent   # HumMobCov/
+DIR_SRC        = PROJECT_ROOT / "src"
+DIR_OUTPUT     = PROJECT_ROOT / "output"
+DIR_DATA       = PROJECT_ROOT / "data"
+DIR_CENSUS     = PROJECT_ROOT / "census_data"
+DIR_CONFIG     = DIR_DATA / "config"
+
+# ---------------------------------------------------------------------------
+# External / server-side data paths  (raw Cuebiq stops)
+# ---------------------------------------------------------------------------
+DIR_CUEBIQ_BASE  = Path("/data/shared/cuebiq/MOBS")
+DIR_RAW_DATA_CA  = DIR_CUEBIQ_BASE / "urban_rural_flow_stops_cali_urban_rural_v3"
+DIR_RAW_DATA_MA  = DIR_CUEBIQ_BASE / "20220330_stops_hq_users_MA"
+
+# Legacy output root — per-user result files from the old pipeline live here.
+# Defaults to the local milestones_analysis/ folder inside the project.
+# Override by setting the environment variable MILESTONES_DIR if the data
+# lives elsewhere (e.g. on a mounted server volume).
+import os as _os
+DIR_MILESTONES_SERVER = Path(
+    _os.environ.get("MILESTONES_DIR", str(PROJECT_ROOT / "milestones_analysis"))
+)
+del _os
+
+# External library path
+DIR_LIBRARIES = Path("/data/rgallotti/libraries/PythonScripts")
+
+# ---------------------------------------------------------------------------
+# Supported regions
+# ---------------------------------------------------------------------------
+LIST_REGIONS = ["CA", "MA"]
+
+# Raw data directory per region
+DIR_RAW_DATA = {
+    "CA": DIR_RAW_DATA_CA,
+    "MA": DIR_RAW_DATA_MA,
+}
+
+# MA comes as fixed named parquet shards
+LIST_FILES_MA = [
+    "subset_1.snappy.parquet",
+    "subset_2.snappy.parquet",
+    "subset_3.snappy.parquet",
+    "subset_4.snappy.parquet",
+    "subset_5.snappy.parquet",
+    "subset_6.snappy.parquet",
+    "subset_7.snappy.parquet",
+    "subset_8.snappy.parquet",
+    "subset_9.snappy.parquet",
+    "subset_a.snappy.parquet",
+    "subset_b.snappy.parquet",
+    "subset_c.snappy.parquet",
+    "subset_d.snappy.parquet",
+    "subset_e.snappy.parquet",
+    "subset_f.snappy.parquet",
+]
+
+# ---------------------------------------------------------------------------
+# Census / reference files per region
+# ---------------------------------------------------------------------------
+CENSUS_FILES = {
+    "CA": {
+        "urban_info":   DIR_CENSUS / "California" / "urban_info_threshold_urbanity_500.csv",
+        "party_county": DIR_CENSUS / "California" / "political_government_per_county.csv",
+        "geojson":      DIR_CENSUS / "California" / "geometry_census_new.geojson",
+    },
+    "MA": {
+        "urban_info":   DIR_CENSUS / "Massachusets" / "Massachusets.csv",
+        "party_county": DIR_CENSUS / "Massachusets" / "political_government_per_county.csv",
+        "geojson":      DIR_CENSUS / "Massachusets" / "geometry_census_new.geojson",
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Time periods (COVID-19 phases, year 2020)
+# ---------------------------------------------------------------------------
+PERIOD_NAMES = [
+    "15 jan - 15 march",
+    "15 march - 15 may",
+    "15 may - sept",
+]
+
+PERIOD_DIVISION = [
+    datetime.datetime(2020,  1, 15),
+    datetime.datetime(2020,  3, 15),
+    datetime.datetime(2020,  5, 15),
+    datetime.datetime(2020,  9, 30),
+]
+
+# Convenience mapping:  period_name -> (start_dt, end_dt)
+PERIOD_NAMES_TO_DIVISION = {
+    PERIOD_NAMES[p]: [PERIOD_DIVISION[p], PERIOD_DIVISION[p + 1]]
+    for p in range(len(PERIOD_NAMES))
+}
+
+# ---------------------------------------------------------------------------
+# Preprocessing parameters
+# ---------------------------------------------------------------------------
+MIN_POINTS_PER_USER   = 20   # np_ — minimum stop-points a user must have per period
+TIME_THRESHOLD_HOURS  = 1    # t_threshold — minimum hours between successive stops
+
+# ---------------------------------------------------------------------------
+# Geography
+# ---------------------------------------------------------------------------
+# Bounding box that covers the contiguous USA + AK/HI
+US_BOUNDING_BOX = [
+    (18.91619,  -171.791110603),
+    (71.3577635769, -171.791110603),
+    (71.3577635769,  -66.96466),
+    (18.91619,  -66.96466),
+]
+
+# ---------------------------------------------------------------------------
+# Analysis parameters
+# ---------------------------------------------------------------------------
+RURALITY_LEVELS  = ["rural", "urban"]
+PARTY_NAMES      = ["Democratic", "Republican"]
+K_RADIUS_VALUES  = [3, 6, 10]          # k values for k-radius of gyration
+
+# S(t) exploration curve — time axis runs from 0 to this value (minutes)
+TIME_INTERVAL_S_MAX = 1420
+
+# ---------------------------------------------------------------------------
+# Output file kinds (used by get_already_saved_user_per_period)
+# ---------------------------------------------------------------------------
+METRIC_FILE_KINDS = ["all_scalars", "gonzalez", "S", "frequency", "weekly_rg"]
+
+# ---------------------------------------------------------------------------
+# Output file name templates  (format with .format(user, period, np_, t))
+# ---------------------------------------------------------------------------
+FNAME_SCALARS      = "all_scalars_{user}_period_{period}_np_{np_}_t_{t}.csv.gz"
+FNAME_GONZALEZ     = "gonzalez_{user}_period_{period}_np_{np_}_t_{t}.csv.gz"
+FNAME_ST           = "S_t_{user}_period_{period}_np_{np_}_t_{t}.csv.gz"
+FNAME_FREQ_RANK    = "frequnecy_rank_{user}_period_{period}_np_{np_}_t_{t}.csv.gz"
+FNAME_WEEKLY_RG    = "weekly_rg_{user}_period_{period}_np_{np_}_t_{t}.json"
+FNAME_WEEK_NPEOPLE = "number_users_period_{period}.json"
+
+# ---------------------------------------------------------------------------
+# Legacy shard-level metric output directories
+# (produced by the old per-parquet-shard pipeline)
+#
+# Directory layout:
+#   DIR_MILESTONES_SERVER / "{metric}_new_threshold" / str(np_) / str(t)
+#
+# Use get_legacy_metric_dir(metric, np_, t) to build the full path.
+# ---------------------------------------------------------------------------
+_LEGACY_METRIC_DIRS: dict = {
+    "gonzalez":  "gonzalez_new_threshold",
+    "rg":        "radius_gyration_measures_new_threshold",
+    "k_rg":      "k_radius_gyration_measures_new_threshold",
+    "entropic":  "entropic_measures_new_threshold",
+    "S":         "st_new_threshold",
+    "frequency": "location_frequency_new_threshold",
+    "distance":  "distance_measures_new_threshold",
+    "home":      "home_new_threshold",
+}
+
+
+def get_legacy_metric_dir(metric: str, np_: int, t: int) -> Path:
+    """Return the shard-output directory for *metric* with given parameters.
+
+    Parameters
+    ----------
+    metric : str
+        One of ``_LEGACY_METRIC_DIRS`` keys, e.g. ``"rg"``, ``"gonzalez"``.
+    np_ : int
+        Minimum-points-per-user threshold (sub-directory level).
+    t : int
+        Time threshold in hours (sub-directory level).
+
+    Returns
+    -------
+    Path
+        ``DIR_MILESTONES_SERVER / "{metric}_new_threshold" / str(np_) / str(t)``
+    """
+    try:
+        base_name = _LEGACY_METRIC_DIRS[metric]
+    except KeyError:
+        raise ValueError(f"Unknown metric {metric!r}. Choose from: {list(_LEGACY_METRIC_DIRS)}")
+    return DIR_MILESTONES_SERVER / base_name / str(np_) / str(t)

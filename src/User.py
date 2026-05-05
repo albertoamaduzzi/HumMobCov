@@ -216,7 +216,8 @@ class User:
             user=self.uname, period=self.period,
             np_=self.np_, t=self.t_threshold,
         )
-        if out_path.exists():
+        # Only skip if the file exists AND has at least one data row (not header-only).
+        if out_path.exists() and out_path.stat().st_size > 200:
             return
 
         mean_lon = np.array(self.df.lat).mean()

@@ -118,6 +118,7 @@ from .datasets  import (          # noqa: F401
 from .pipeline  import (          # noqa: F401
     compute_all,
     analyze_from_dataset,
+    analyze_from_s3_progressive,
     get_config,
 )
 from .plotter   import plotter    # noqa: F401

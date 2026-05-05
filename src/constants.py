@@ -37,6 +37,32 @@ import os as _os
 DIR_MILESTONES_SERVER = Path(
     _os.environ.get("MILESTONES_DIR", str(PROJECT_ROOT / "milestones_analysis"))
 )
+
+# ---------------------------------------------------------------------------
+# S3 / object-store configuration
+# Raw Cuebiq stop-point shards live on an S3-compatible store.
+# All values can be overridden via environment variables.
+# ---------------------------------------------------------------------------
+S3_ENDPOINT_URL: str = _os.environ.get("S3_ENDPOINT_URL", "https://s3.atlas.fbk.eu")
+S3_BUCKET:       str = _os.environ.get("S3_BUCKET",       "chub-datalake")
+
+# S3 key prefixes for raw Cuebiq stop-point shards (one parquet file per shard)
+S3_RAW_PREFIX: dict[str, str] = {
+    "CA": _os.environ.get(
+        "S3_PREFIX_CA",
+        "shared/cuebiq/MOBS/urban_rural_flow_stops_cali_urban_rural_v3",
+    ),
+    "MA": _os.environ.get(
+        "S3_PREFIX_MA",
+        "shared/cuebiq/MOBS/20220330_stops_hq_users_MA",
+    ),
+}
+
+# Local temp directory for downloaded shards — deleted immediately after processing
+DIR_SHARD_TEMP = Path(
+    _os.environ.get("SHARD_TEMP_DIR", str(PROJECT_ROOT / ".shard_tmp"))
+)
+
 del _os
 
 # External library path
@@ -143,6 +169,58 @@ TIME_INTERVAL_S_MAX = 1420
 METRIC_FILE_KINDS = ["all_scalars", "gonzalez", "S", "frequency", "weekly_rg"]
 
 # ---------------------------------------------------------------------------
+# Scalar metric definitions
+# ---------------------------------------------------------------------------
+# All scalar metric names stored in the all_scalars parquet table.
+# Float metrics (stored as Float64 / NaN when missing).
+SCALAR_METRICS_FLOAT: list[str] = [
+    "radius_gyration",        # radius of gyration [km]
+    "random_entropy",         # S_rand — Boltzmann entropy of visits
+    "uncorrelated_entropy",   # S_unc  — entropy ignoring temporal order
+    "real_entropy",           # S_real — true entropy of trajectory
+    "distance",               # mean inter-stop distance [km]
+    "q",                      # predictability limit
+] + [f"rg_{k}" for k in K_RADIUS_VALUES]   # rg_3, rg_6, rg_10
+
+# String / categorical metrics (stored as Utf8 / empty-string when missing).
+SCALAR_METRICS_STR: list[str] = [
+    "home",              # home location geohash7
+    "home_geohash7",     # alias kept for backward compatibility
+    "county_home",       # county of home location
+    "party_government",  # political party of home county
+    "rurality_level",    # "urban" | "rural"
+]
+
+# Full ordered list — float fields first, then string fields.
+# This is the canonical column order for the all_scalars parquet.
+ALL_SCALAR_METRICS: list[str] = SCALAR_METRICS_FLOAT + SCALAR_METRICS_STR
+
+# ---------------------------------------------------------------------------
+# Gonzalez (PCA trajectory shape) parquet schema
+# ---------------------------------------------------------------------------
+# Long-format table: one row per (user × visited_location).
+# Columns written to gonzalez parquet shards.
+GONZALEZ_COLUMNS: list[str] = [
+    "user_id",   # str  — user identifier
+    "x_norm",    # float — normalised x-coord along 1st principal axis (= x / sigmax)
+    "y_norm",    # float — normalised y-coord along 2nd principal axis (= y / sigmay)
+    "sigmax",    # float — std dev of locations along 1st axis [km]
+    "sigmay",    # float — std dev of locations along 2nd axis [km]
+]
+
+# ---------------------------------------------------------------------------
+# Frequency / rank parquet schema
+# ---------------------------------------------------------------------------
+# Long-format table: one row per (user × visited_location rank).
+FREQUENCY_COLUMNS: list[str] = [
+    "user_id",           # str  — user identifier
+    "rank",              # int  — rank of location (1 = most visited)
+    "frequency",         # float — relative visit frequency
+    "geohash6",          # str  — geohash6 of location
+    "geohash7",          # str  — geohash7 of location
+]
+
+# ---------------------------------------------------------------------------
 # Output file name templates  (format with .format(user, period, np_, t))
 # ---------------------------------------------------------------------------
 FNAME_SCALARS      = "all_scalars_{user}_period_{period}_np_{np_}_t_{t}.csv.gz"
@@ -156,11 +234,71 @@ FNAME_WEEK_NPEOPLE = "number_users_period_{period}.json"
 # Legacy shard-level metric output directories
 # (produced by the old per-parquet-shard pipeline)
 #
-# Directory layout:
-#   DIR_MILESTONES_SERVER / "{metric}_new_threshold" / str(np_) / str(t)
+# Two layouts exist:
+#
+#   CA (dataxuser/)
+#     dataxuser/{metric}_{uid}_period_{period}_np_{np_}_t_{t}.csv.gz
+#     One file per user per metric.
+#
+#   MA (metric-specific directories)
+#     {metric_dir}/{np_}/{t}/{prefix}_{period}_{np_}_threshold_{t}_hour_{shard}.csv
+#     One file per shard containing all users in that shard.
 #
 # Use get_legacy_metric_dir(metric, np_, t) to build the full path.
 # ---------------------------------------------------------------------------
+
+# MA metric folder names and per-metric CSV/JSON file-name prefixes.
+# Layout:  milestones_analysis/MA/{folder}/{np_}/{t}/{prefix}_{period}...
+MA_LEGACY_METRIC_DIRS: dict[str, dict] = {
+    "rg": {
+        "folder": "radius_gyration_measures_new_threshold",
+        "prefix": "rg",                       # rg_{period}_{np_}_threshold_{t}_hour_...csv
+        "file_ext": ".csv",
+        "scalar_col": "radius_gyration",       # target all_scalars column name
+    },
+    "distance": {
+        "folder": "distance_measures_new_threshold",
+        "prefix": "dist",                      # dist_{period}_{np_}_threshold_{t}_hour_...csv
+        "file_ext": ".csv",
+        "scalar_col": "distance",
+    },
+    "k_rg": {
+        "folder": "k_radius_gyration_measures_new_threshold",
+        # k is encoded as prefix: 3k_rg, 6k_rg, 10k_rg
+        "k_prefixes": {3: "3k_rg", 6: "6k_rg", 10: "10k_rg"},
+        "file_ext": ".csv",
+    },
+    "entropic": {
+        "folder": "entropic_measures_new_threshold",
+        # Aggregate files — one file per period.
+        # real_entropy_{period}_{np_}_threshold_{t}_hour.csv  (cols: ;values;uid)
+        # uncorr_entropy_{period}_{np_}_threshold_{t}_hour.json  ({values, uid})
+        # rdm_entropy_{period}_{np_}_threshold_{t}_hour.json   ({values, uid})
+        "file_ext_csv": ".csv",
+        "file_ext_json": ".json",
+    },
+    "gonzalez": {
+        "folder": "gonzalez_new_threshold",
+        "prefix": "gonzalez",
+        "file_ext": ".json",   # {x_sigmax:{values,uid}, y_sigmay:{values,uid}, ...}
+    },
+    "S": {
+        "folder": "st_new_threshold",
+        "prefix": "dict_s",    # dict_s_{period}_{np_}_part-{shard}_hour_{t}_CA.csv
+        "file_ext": ".csv",    # rows=users (no uid!), cols=time steps
+    },
+    "frequency": {
+        "folder": "location_frequency_new_threshold",
+        "file_ext": ".csv",
+    },
+    "home": {
+        "folder": "home_new_threshold",
+        "prefix": "home",      # home_{period}_{np_}_threshold_{t}_hour_subset_N.csv
+        "file_ext": ".csv",    # cols: ;home_lat;home_lon;uid
+    },
+}
+
+# Convenience mapping:  metric_key → legacy folder path (for CA dataxuser style too)
 _LEGACY_METRIC_DIRS: dict = {
     "gonzalez":  "gonzalez_new_threshold",
     "rg":        "radius_gyration_measures_new_threshold",
@@ -173,11 +311,13 @@ _LEGACY_METRIC_DIRS: dict = {
 }
 
 
-def get_legacy_metric_dir(metric: str, np_: int, t: int) -> Path:
+def get_legacy_metric_dir(region: str, metric: str, np_: int, t: int) -> Path:
     """Return the shard-output directory for *metric* with given parameters.
 
     Parameters
     ----------
+    region : str
+        ``"CA"`` or ``"MA"``.
     metric : str
         One of ``_LEGACY_METRIC_DIRS`` keys, e.g. ``"rg"``, ``"gonzalez"``.
     np_ : int
@@ -188,10 +328,16 @@ def get_legacy_metric_dir(metric: str, np_: int, t: int) -> Path:
     Returns
     -------
     Path
-        ``DIR_MILESTONES_SERVER / "{metric}_new_threshold" / str(np_) / str(t)``
+        For MA: ``DIR_MILESTONES_SERVER / "MA" / "{folder}" / str(np_) / str(t)``
+        For CA: ``DIR_MILESTONES_SERVER / "CA" / "dataxuser"``
     """
+    if region == "CA":
+        return DIR_MILESTONES_SERVER / "CA" / "dataxuser"
     try:
-        base_name = _LEGACY_METRIC_DIRS[metric]
+        if region == "MA":
+            folder = MA_LEGACY_METRIC_DIRS[metric]["folder"]
+        else:
+            folder = _LEGACY_METRIC_DIRS[metric]
     except KeyError:
         raise ValueError(f"Unknown metric {metric!r}. Choose from: {list(_LEGACY_METRIC_DIRS)}")
-    return DIR_MILESTONES_SERVER / base_name / str(np_) / str(t)
+    return DIR_MILESTONES_SERVER / region / folder / str(np_) / str(t)

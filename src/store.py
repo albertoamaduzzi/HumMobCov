@@ -52,9 +52,12 @@ from typing import Any
 import numpy as np
 import polars as pl
 
+import re as _re
+
 from .constants import (
     K_RADIUS_VALUES,
     TIME_INTERVAL_S_MAX,
+    MA_LEGACY_METRIC_DIRS,
 )
 from .utils import ifnotexistsmkdir
 
@@ -660,6 +663,319 @@ class ParquetStore:
                 self.consolidate_all(period)
         if verbose:
             print("\nMigration complete.")
+
+    # ------------------------------------------------------------------
+    # MA-specific migration (metric-folder layout)
+    # ------------------------------------------------------------------
+
+    def migrate_from_legacy_MA(
+        self,
+        ma_legacy_base: Path | str,
+        period: str,
+        np_: int,
+        t: int,
+        batch_size: int = 2000,
+        verbose: bool = True,
+    ) -> None:
+        """
+        Migrate one period of legacy MA data into the parquet store.
+
+        MA data is organised into per-metric directories rather than a
+        single ``dataxuser/`` folder.  Each directory contains CSV/JSON
+        *shard* files (one shard = one original parquet partition) covering
+        all users in that shard.
+
+        Metric-folder layout::
+
+            ma_legacy_base/
+                radius_gyration_measures_new_threshold/{np_}/{t}/
+                    rg_{period}_{np_}_threshold_{t}_hour_{shard}.csv
+                distance_measures_new_threshold/{np_}/{t}/
+                    dist_{period}_{np_}_threshold_{t}_hour_{shard}.csv
+                k_radius_gyration_measures_new_threshold/{np_}/{t}/
+                    3k_rg_{period}_{np_}_threshold_{t}_hour_{shard}.csv
+                    6k_rg_{period}_{np_}_threshold_{t}_hour_{shard}.csv
+                    10k_rg_{period}_{np_}_threshold_{t}_hour_{shard}.csv
+                entropic_measures_new_threshold/{np_}/{t}/
+                    real_entropy_{period}_{np_}_threshold_{t}_hour.csv
+                    uncorr_entropy_{period}_{np_}_threshold_{t}_hour.json
+                    rdm_entropy_{period}_{np_}_threshold_{t}_hour.json
+                gonzalez_new_threshold/{np_}/{t}/
+                    gonzalez_{period}_{np_}_*_{t}_{shard}.json
+                st_new_threshold/{np_}/{t}/
+                    dict_s_{period}_{np_}_{shard}_hour_{t}*.csv
+                home_new_threshold/{np_}/{t}/
+                    home_{period}_{np_}_threshold_{t}_hour_{shard}.csv
+
+        S(t) files do **not** contain a uid column; row order is matched to
+        the corresponding rg shard file using the shared Spark TID string
+        embedded in both filenames (``part-NNNNN-tid-…-c000``).
+
+        Parameters
+        ----------
+        ma_legacy_base : Path or str
+            ``milestones_analysis/MA/`` directory.
+        period : str
+            Period name, e.g. ``"15 jan - 15 march"``.
+        np_, t : int
+            Sub-directory selectors (must match legacy computation params).
+        batch_size : int
+            Users accumulated before each shard write.
+        verbose : bool
+        """
+        import pandas as _pd
+
+        ma_legacy_base = Path(ma_legacy_base)
+
+        done_scalars  = self.get_computed_users(period, "all_scalars")
+        done_gonzalez = self.get_computed_users_long(period, "gonzalez")
+        done_st       = self.get_computed_users(period, "S")
+
+        # ── helpers ──────────────────────────────────────────────────────
+
+        def _metric_dir(key: str) -> Path:
+            folder = MA_LEGACY_METRIC_DIRS[key]["folder"]
+            return ma_legacy_base / folder / str(np_) / str(t)
+
+        def _period_in_file(fname: str) -> bool:
+            """Return True when *period* appears in the filename."""
+            return period in fname
+
+        def _read_uid_value_csv(path: Path) -> dict[str, float]:
+            """Read a ;-separated CSV with uid and values cols → {uid: float}."""
+            try:
+                df = _pd.read_csv(path, sep=";", usecols=["uid", "values"])
+                return dict(zip(df["uid"].astype(str), df["values"].astype(float)))
+            except Exception:
+                return {}
+
+        def _read_uid_value_json(path: Path) -> dict[str, float]:
+            """Read a {values:[...], uid:[...]} JSON → {uid: float}."""
+            try:
+                with open(path) as fh:
+                    d = _json.load(fh)
+                return {str(u): float(v) for u, v in zip(d["uid"], d["values"])}
+            except Exception:
+                return {}
+
+        def _extract_tid(fname: str) -> str | None:
+            """Extract the Spark TID token (part-NNNNN-tid-…-c000) from filename."""
+            m = _re.search(r"(part-\d+-tid-[^_\s.]+)", fname)
+            return m.group(1) if m else None
+
+        # ── 1. SCALARS ────────────────────────────────────────────────────
+        # uid → {metric: value}  (merged from multiple source folders)
+        uid_scalars: dict[str, dict[str, Any]] = {}
+
+        def _accumulate(src_dict: dict[str, float], metric_name: str) -> None:
+            for uid, val in src_dict.items():
+                uid_scalars.setdefault(uid, {})[metric_name] = val
+
+        # radius of gyration
+        rg_dir = _metric_dir("rg")
+        rg_uid_map: dict[str, list[str]] = {}   # tid → ordered uid list (for S(t))
+        if rg_dir.exists():
+            for f in sorted(rg_dir.glob("*.csv")):
+                if not _period_in_file(f.name):
+                    continue
+                mapping = _read_uid_value_csv(f)
+                _accumulate(mapping, "radius_gyration")
+                tid = _extract_tid(f.name)
+                if tid:
+                    rg_uid_map[tid] = list(mapping.keys())
+
+        # distance
+        dist_dir = _metric_dir("distance")
+        if dist_dir.exists():
+            for f in sorted(dist_dir.glob("*.csv")):
+                if _period_in_file(f.name):
+                    _accumulate(_read_uid_value_csv(f), "distance")
+
+        # k-radius of gyration (k = 3, 6, 10)
+        krg_dir = _metric_dir("k_rg")
+        if krg_dir.exists():
+            k_prefix_map = MA_LEGACY_METRIC_DIRS["k_rg"]["k_prefixes"]
+            for k, prefix in k_prefix_map.items():
+                col = f"rg_{k}"
+                for f in sorted(krg_dir.glob(f"{prefix}_*.csv")):
+                    if _period_in_file(f.name):
+                        _accumulate(_read_uid_value_csv(f), col)
+
+        # entropic measures (may not exist for all t values)
+        entropic_dir = _metric_dir("entropic")
+        if entropic_dir.exists():
+            for f in sorted(entropic_dir.iterdir()):
+                if not _period_in_file(f.name):
+                    continue
+                bn = f.name
+                if bn.startswith("real_entropy") and bn.endswith(".csv"):
+                    _accumulate(_read_uid_value_csv(f), "real_entropy")
+                elif bn.startswith("uncorr_entropy") and bn.endswith(".json"):
+                    _accumulate(_read_uid_value_json(f), "uncorrelated_entropy")
+                elif bn.startswith("rdm_entropy") and bn.endswith(".json"):
+                    _accumulate(_read_uid_value_json(f), "random_entropy")
+
+        # home (lat/lon → stored as "lat;lon" string in the `home` field)
+        home_dir = _metric_dir("home")
+        if home_dir.exists():
+            for f in sorted(home_dir.glob("*.csv")):
+                if not _period_in_file(f.name):
+                    continue
+                try:
+                    hdf = _pd.read_csv(f, sep=";", usecols=["uid", "home_lat", "home_lon"])
+                    for _, row in hdf.iterrows():
+                        uid_scalars.setdefault(str(row["uid"]), {})["home"] = (
+                            f"{row['home_lat']:.6f};{row['home_lon']:.6f}"
+                        )
+                except Exception:
+                    continue
+
+        # Write scalars in batches (skip already-done users)
+        scalar_batch: dict[str, dict] = {}
+        scalar_count = 0
+        for uid, metrics in uid_scalars.items():
+            if uid in done_scalars:
+                continue
+            scalar_batch[uid] = metrics
+            scalar_count += 1
+            if len(scalar_batch) >= batch_size:
+                self.write_scalars_batch(period, scalar_batch)
+                scalar_batch.clear()
+                if verbose:
+                    print(f"    [{period}] scalars: flushed {scalar_count} …")
+        if scalar_batch:
+            self.write_scalars_batch(period, scalar_batch)
+        if verbose:
+            print(f"  [{period}] scalars: {scalar_count} users written.")
+
+        # ── 2. GONZALEZ ────────────────────────────────────────────────────
+        # MA gonzalez JSON format:
+        #   {x_sigmax: {values:[...], uid:[...]}, y_sigmay: {...}, sigmax: {...}, sigmay: {...}}
+        # x_sigmax = x / sigmax (normalised), y_sigmay = y / sigmay (normalised)
+        gonzalez_dir = _metric_dir("gonzalez")
+        gonzalez_count = 0
+        if gonzalez_dir.exists():
+            gonzalez_batch: dict[str, _pd.DataFrame] = {}
+            for f in sorted(gonzalez_dir.glob("*.json")):
+                if not _period_in_file(f.name):
+                    continue
+                try:
+                    with open(f) as fh:
+                        raw = _json.load(fh)
+                    # Build per-user DataFrames from the shard-level JSON
+                    # Each key has {values: [...], uid: [...]}.
+                    # Only x_sigmax, y_sigmay, sigmax, sigmay are reliable;
+                    # 'x' and 'y' are often empty in the legacy files.
+                    x_norm_map  = dict(zip(raw["x_sigmax"]["uid"], raw["x_sigmax"]["values"]))
+                    y_norm_map  = dict(zip(raw["y_sigmay"]["uid"], raw["y_sigmay"]["values"]))
+                    sigmax_map  = dict(zip(raw.get("sigmax", {}).get("uid", []),
+                                          raw.get("sigmax", {}).get("values", [])))
+                    sigmay_map  = dict(zip(raw.get("sigmay", {}).get("uid", []),
+                                          raw.get("sigmay", {}).get("values", [])))
+
+                    all_uids = set(x_norm_map) | set(y_norm_map)
+                    for uid in all_uids:
+                        uid = str(uid)
+                        if uid in done_gonzalez:
+                            continue
+                        df = _pd.DataFrame({
+                            "x_norm":  [x_norm_map.get(uid, float("nan"))],
+                            "y_norm":  [y_norm_map.get(uid, float("nan"))],
+                            "sigmax":  [sigmax_map.get(uid, float("nan"))],
+                            "sigmay":  [sigmay_map.get(uid, float("nan"))],
+                        })
+                        gonzalez_batch[uid] = df
+                        gonzalez_count += 1
+                        if len(gonzalez_batch) >= batch_size:
+                            self.write_gonzalez_batch(period, gonzalez_batch)
+                            gonzalez_batch.clear()
+                            if verbose:
+                                print(f"    [{period}] gonzalez: flushed {gonzalez_count} …")
+                except Exception:
+                    continue
+            if gonzalez_batch:
+                self.write_gonzalez_batch(period, gonzalez_batch)
+        if verbose:
+            print(f"  [{period}] gonzalez: {gonzalez_count} users written.")
+
+        # ── 3. S(t) ────────────────────────────────────────────────────────
+        # MA S(t) files: rows=users (no uid), cols=time steps (0..1419).
+        # Uid is recovered by matching the Spark TID from the filename to the
+        # corresponding rg shard file (same TID → same row order).
+        st_dir = _metric_dir("S")
+        st_count = 0
+        if st_dir.exists() and rg_uid_map:
+            st_batch: dict[str, list] = {}
+            for f in sorted(st_dir.glob("*.csv")):
+                if not _period_in_file(f.name):
+                    continue
+                tid = _extract_tid(f.name)
+                if tid is None or tid not in rg_uid_map:
+                    continue
+                uid_list = rg_uid_map[tid]
+                try:
+                    st_df = _pd.read_csv(f, sep=";", index_col=0)
+                    if len(st_df) != len(uid_list):
+                        # Row count mismatch — skip this shard
+                        continue
+                    for row_idx, uid in enumerate(uid_list):
+                        uid = str(uid)
+                        if uid in done_st:
+                            continue
+                        st_batch[uid] = st_df.iloc[row_idx].tolist()
+                        st_count += 1
+                        if len(st_batch) >= batch_size:
+                            self.write_st_batch(period, st_batch)
+                            st_batch.clear()
+                            if verbose:
+                                print(f"    [{period}] S(t): flushed {st_count} …")
+                except Exception:
+                    continue
+            if st_batch:
+                self.write_st_batch(period, st_batch)
+        if verbose:
+            print(f"  [{period}] S(t): {st_count} users written.")
+
+    def migrate_all_periods_MA(
+        self,
+        ma_legacy_base: Path | str,
+        period_names: list[str],
+        np_: int,
+        t: int,
+        batch_size: int = 2000,
+        consolidate: bool = True,
+        verbose: bool = True,
+    ) -> None:
+        """
+        Migrate all periods of MA legacy data into the parquet store.
+
+        Parameters
+        ----------
+        ma_legacy_base : Path or str
+            ``milestones_analysis/MA/`` directory.
+        period_names : list[str]
+            Periods to migrate (typically ``PERIOD_NAMES``).
+        np_, t : int
+            Sub-directory selectors.
+        batch_size : int
+            Users per shard write.
+        consolidate : bool
+            If True merge shards after each period.
+        verbose : bool
+        """
+        for period in period_names:
+            if verbose:
+                print(f"\nMigrating MA period: {period!r} …")
+            self.migrate_from_legacy_MA(
+                ma_legacy_base, period, np_, t,
+                batch_size=batch_size, verbose=verbose,
+            )
+            if consolidate:
+                if verbose:
+                    print(f"  Consolidating shards for '{period}' …")
+                self.consolidate_all(period)
+        if verbose:
+            print("\nMA migration complete.")
 
 
 # ---------------------------------------------------------------------------

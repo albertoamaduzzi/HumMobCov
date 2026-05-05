@@ -2,14 +2,25 @@
 pipeline.py
 ===========
 High-level processing pipeline: per-user metric computation and the
-top-level ``analyze_from_dataset`` orchestrator.
+top-level orchestrators.
+
+Execution modes
+---------------
+``analyze_from_dataset``
+    Process raw parquet shards already present on the local filesystem.
+    Resume-safe at the user level via parquet footer metadata (O(1)).
+
+``analyze_from_s3_progressive``
+    Download one raw shard at a time from an S3-compatible store, compute
+    all metrics, flush to the parquet store, then delete the local copy.
+    Resume-safe at both the *shard* level (``shard_checkpoint_*.json``) and
+    the *user* level (parquet footer metadata).  Designed to be re-run many
+    times — each run picks up exactly where the previous one stopped.
 
 Parquet-store mode
 ------------------
-Pass a ``ParquetStore`` instance (``store=``) to ``compute_all`` or
-``analyze_from_dataset`` to use the new columnar parquet backend.
-
-When ``store`` is supplied:
+Pass a ``ParquetStore`` instance (``store=``) to ``compute_all`` or either
+orchestrator to use the new columnar parquet backend.
 
 * Resume check is done via parquet footer metadata (O(1), no data load).
 * Per-user results are batched in memory and written as shard parquet files
@@ -18,6 +29,7 @@ When ``store`` is supplied:
 """
 
 import json
+import subprocess
 import time
 from pathlib import Path
 from collections import defaultdict
@@ -32,7 +44,7 @@ from .utils     import (
     get_already_saved_user_per_period,
     ifnotexistsmkdir,
 )
-from .constants import DIR_OUTPUT, DIR_CONFIG, DIR_MILESTONES_SERVER
+from .constants import DIR_OUTPUT, DIR_CONFIG, DIR_MILESTONES_SERVER, DIR_SHARD_TEMP
 
 if TYPE_CHECKING:
     from .store import ParquetStore
@@ -412,3 +424,198 @@ def analyze_from_dataset(
                 f"  Period '{period}' — users: {dataset.period2totalusers[period]:,}  "
                 f"points: {dataset.period2totalpoints[period]:,}"
             )
+
+
+# ---------------------------------------------------------------------------
+# S3 progressive orchestrator
+# ---------------------------------------------------------------------------
+
+def analyze_from_s3_progressive(
+    dataset: _BaseDataset,
+    region: str,
+    cfg: dict,
+    store: "ParquetStore",
+    *,
+    endpoint_url: str,
+    bucket: str,
+    s3_prefix: str,
+    temp_dir: Path | None = None,
+    batch_size: int = 500,
+    consolidate_every: int = 1,
+) -> None:
+    """
+    Download raw Cuebiq parquet shards from S3 one at a time, compute all
+    enabled metrics, save results to *store*, then delete the local copy.
+
+    This function is designed to be interrupted and restarted safely:
+
+    * **Shard-level resume** — a JSON checkpoint file
+      ``milestones_analysis/{region}/shard_checkpoint_np_{np_}_t_{t}.json``
+      records every shard that has been fully processed.  On restart, those
+      shards are skipped entirely.
+
+    * **User-level resume** — within each shard, users already present in
+      *store* are detected via parquet footer metadata (O(1)) and skipped,
+      so partial progress inside an interrupted shard is preserved.
+
+    Parameters
+    ----------
+    dataset : _BaseDataset
+        Initialised region dataset object.
+    region : str
+        ``"CA"`` or ``"MA"``.
+    cfg : dict
+        Algorithm-flow config from ``get_config()``.
+    store : ParquetStore
+        Target parquet store where results will be written.
+    endpoint_url : str
+        S3-compatible endpoint URL (e.g. ``"https://s3.atlas.fbk.eu"``).
+    bucket : str
+        Bucket name (e.g. ``"chub-datalake"``).
+    s3_prefix : str
+        Key prefix for raw shard files inside the bucket (no leading slash,
+        no trailing slash).
+    temp_dir : Path, optional
+        Local directory for downloading shards before processing.
+        Defaults to ``DIR_SHARD_TEMP``.
+    batch_size : int
+        Users to accumulate per parquet shard write.
+    consolidate_every : int
+        Consolidate the parquet store after every *N* processed shards
+        (default 1 = after every shard).  Larger values reduce I/O at the
+        cost of larger individual shard files.
+    """
+    _temp_dir = Path(temp_dir) if temp_dir else DIR_SHARD_TEMP
+    _temp_dir.mkdir(parents=True, exist_ok=True)
+
+    # ── 1. List available shards on S3 ─────────────────────────────────────
+    s3_uri = f"s3://{bucket}/{s3_prefix}"
+    print(f"Listing shards at {s3_uri} …")
+    result = subprocess.run(
+        ["aws", "s3", "ls", s3_uri + "/", "--endpoint-url", endpoint_url],
+        capture_output=True, text=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"aws s3 ls failed:\n  stdout: {result.stdout}\n  stderr: {result.stderr}"
+        )
+
+    shard_names: list[str] = [
+        line.split()[-1]
+        for line in result.stdout.strip().splitlines()
+        if line.strip() and line.split()[-1].endswith(".parquet")
+    ]
+    if not shard_names:
+        print(f"No .parquet shards found at {s3_uri}. Nothing to do.")
+        return
+
+    # ── 2. Load shard-level checkpoint ──────────────────────────────────────
+    checkpoint_path = (
+        DIR_MILESTONES_SERVER
+        / region
+        / f"shard_checkpoint_np_{dataset.np_}_t_{dataset.t_threshold}.json"
+    )
+    if checkpoint_path.exists():
+        with open(checkpoint_path) as _f:
+            completed_shards: set[str] = set(json.load(_f).get("completed", []))
+    else:
+        completed_shards = set()
+
+    pending = [s for s in shard_names if s not in completed_shards]
+    print(
+        f"Shards — total: {len(shard_names)}  "
+        f"completed: {len(completed_shards)}  "
+        f"pending: {len(pending)}"
+    )
+
+    if not pending:
+        print("All shards already processed. Nothing to do.")
+        return
+
+    # ── 3. Process shards one by one ────────────────────────────────────────
+    for shard_idx, shard_name in enumerate(pending):
+        local_path = _temp_dir / shard_name
+        s3_key     = f"s3://{bucket}/{s3_prefix}/{shard_name}"
+
+        print(f"\n[{shard_idx + 1}/{len(pending)}] Processing {shard_name} …")
+
+        # 3a. Download
+        print(f"  Downloading from {s3_key} …")
+        dl = subprocess.run(
+            ["aws", "s3", "cp", s3_key, str(local_path),
+             "--endpoint-url", endpoint_url],
+            capture_output=True, text=True,
+        )
+        if dl.returncode != 0:
+            print(f"  WARNING: download failed — skipping shard.\n  {dl.stderr.strip()}")
+            continue
+
+        # 3b. Preprocess
+        try:
+            df_info = dataset_info(
+                local_path,
+                dataset.period_division,
+                dataset.period_names,
+                dataset.np_,
+                dataset.t_threshold,
+                dataset.bounding_box,
+            )
+            print(f"  Loaded {len(df_info.df):,} rows. Preprocessing …")
+            df_info.preprocess()
+        except Exception as exc:
+            print(f"  WARNING: preprocessing error — skipping shard.\n  {exc}")
+            local_path.unlink(missing_ok=True)
+            continue
+
+        # 3c. Compute metrics per period
+        try:
+            for period in df_info.period_names:
+                n_users = len(df_info.period2listusers[period])
+                dataset.period2totalusers[period] += n_users
+                if n_users == 0:
+                    continue
+                print(f"  Period '{period}': {n_users:,} users …")
+                compute_all(
+                    cfg,
+                    dataset,
+                    df_info.period2listusers[period],
+                    period,
+                    df_info,
+                    store=store,
+                    batch_size=batch_size,
+                )
+        except Exception as exc:
+            print(f"  WARNING: compute error — skipping shard.\n  {exc}")
+            local_path.unlink(missing_ok=True)
+            continue
+
+        # 3d. Delete local copy immediately to save disk space
+        local_path.unlink(missing_ok=True)
+        print(f"  Local copy deleted.")
+
+        # 3e. Update shard checkpoint
+        completed_shards.add(shard_name)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(checkpoint_path, "w") as _f:
+            json.dump({"completed": sorted(completed_shards)}, _f, indent=2)
+
+        # 3f. Periodic consolidation
+        if (shard_idx + 1) % consolidate_every == 0:
+            print(f"  Consolidating store …")
+            for period in dataset.period_names:
+                store.consolidate_all(period)
+
+        print(
+            f"  Cumulative users: "
+            + "  ".join(
+                f"{p!r}: {dataset.period2totalusers[p]:,}"
+                for p in dataset.period_names
+            )
+        )
+
+    # ── 4. Final consolidation ───────────────────────────────────────────────
+    print("\nFinal store consolidation …")
+    for period in dataset.period_names:
+        store.consolidate_all(period)
+    print("Done.")
+

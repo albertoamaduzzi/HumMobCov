@@ -12,6 +12,8 @@
 *.ipynb_checkpoints
 *.csv
 *.xlsx
+.shard_tmp/
+*__pycache__/
 *.json
 
 

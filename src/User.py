@@ -77,7 +77,7 @@ class User:
 
         self.period_names2period_division = period_names2period_division
         self.df2save            = defaultdict(list)
-        self.df2save_gonzalez   = defaultdict()
+        self.df2save_gonzalez   = None   # set to pd.DataFrame by compute_gonzalez()
         self.week2rg            = defaultdict()
 
         # Output directory

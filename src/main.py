@@ -121,6 +121,20 @@ def parse_args():
         help="Consolidate store every N shards in S3 mode.",
     )
     parser.add_argument(
+        "--workers", dest="n_workers", type=int, default=None,
+        help=(
+            "Number of parallel worker processes. "
+            "Vectorized mode: used for real_entropy / S(t) / Gonzalez. "
+            "Legacy mode: used for the full per-user skmob loop. "
+            "Defaults to os.cpu_count()."
+        ),
+    )
+    parser.add_argument(
+        "--no-vectorized", dest="use_vectorized", action="store_false",
+        help="Disable the polars/numpy vectorized path and use the legacy skmob per-user loop.",
+    )
+    parser.set_defaults(use_vectorized=True)
+    parser.add_argument(
         "--skip-pipeline", action="store_true",
         help="Skip section 2 (pipeline / migration) and go straight to visualisation.",
     )
@@ -208,8 +222,14 @@ def section_main(args, dataset, cfg):
     ]
     periods_todo = [p for p in PERIOD_NAMES if p not in periods_done]
 
-    print(f"Periods already in store : {periods_done or 'none'}")
-    print(f"Periods still to compute : {periods_todo or 'none'}")
+    import os as _os
+    n_workers = args.n_workers if args.n_workers is not None else (_os.cpu_count() or 1)
+    use_vectorized = args.use_vectorized
+
+    print(f"Periods already in store  : {periods_done or 'none'}")
+    print(f"Periods still to compute  : {periods_todo or 'none'}")
+    print(f"Compute path              : {'vectorized (polars)' if use_vectorized else 'legacy (skmob)'}")
+    print(f"Worker processes          : {n_workers}  [logical CPUs: {_os.cpu_count()}]")
 
     if not periods_todo:
         print("Parquet store already populated for all periods. Nothing to do.")
@@ -222,11 +242,13 @@ def section_main(args, dataset, cfg):
             print(f"\nMODE A — local raw data ({len(local_raw_files)} shards found).")
             analyze_from_dataset(
                 dataset,
-                region     = args.region,
-                config_dir = args.config_dir,
-                output_dir = args.output_dir,
-                store      = store,
-                batch_size = args.batch_size,
+                region          = args.region,
+                config_dir      = args.config_dir,
+                output_dir      = args.output_dir,
+                store           = store,
+                batch_size      = args.batch_size,
+                n_workers       = n_workers,
+                use_vectorized  = use_vectorized,
             )
             print("Computation complete. Consolidating shards…")
             for p in dataset.period_names:
@@ -254,6 +276,8 @@ def section_main(args, dataset, cfg):
                 temp_dir          = temp_dir,
                 batch_size        = args.batch_size,
                 consolidate_every = args.consolidate_every,
+                n_workers         = n_workers,
+                use_vectorized    = use_vectorized,
             )
 
         # ── CASE C-CA: migrate legacy dataxuser per-user CSV.gz files ─────────

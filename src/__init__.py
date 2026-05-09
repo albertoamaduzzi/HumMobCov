@@ -129,5 +129,17 @@ from .plotter   import plotter    # noqa: F401
 from .store     import (          # noqa: F401
     ParquetStore,
 )
+from .gap_analysis_plots import (  # noqa: F401
+    # standalone plot functions (Gap 1-4)
+    plot_npi_timeline,
+    plot_sampling_bias_coverage,
+    plot_sampling_bias_quintiles,
+    plot_party_rurality_regression,
+    plot_post_lockdown_asymmetry,
+    # data helper
+    compute_users_per_county,
+    # default NPI event dates
+    NPI_EVENTS,
+)
 
 warnings.filterwarnings("ignore")

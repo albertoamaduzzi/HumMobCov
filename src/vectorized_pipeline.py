@@ -85,6 +85,8 @@ if TYPE_CHECKING:
     from .store import ParquetStore
     from .datasets import _BaseDataset
 
+from concurrent.futures import ProcessPoolExecutor
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -529,6 +531,36 @@ def _compute_real_entropy_polars(df: pl.DataFrame) -> pl.DataFrame:
     return df.group_by("userId").map_groups(_group_fn)
 
 
+# ---------------------------------------------------------------------------
+# Top-level worker functions (module-level — required for multiprocessing pickle)
+# ---------------------------------------------------------------------------
+
+def _re_worker(chunk_df: pl.DataFrame) -> pl.DataFrame:
+    """ProcessPoolExecutor worker: real_entropy for a user chunk."""
+    return _compute_real_entropy_polars(chunk_df)
+
+
+def _st_worker(args: tuple) -> dict:
+    """ProcessPoolExecutor worker: S(t) for a user chunk."""
+    chunk_df, t_threshold = args
+    return _compute_st_polars(chunk_df, t_threshold)
+
+
+def _gonz_worker(chunk_df: pl.DataFrame) -> dict:
+    """ProcessPoolExecutor worker: Gonzalez for a user chunk."""
+    return _compute_gonzalez_polars(chunk_df)
+
+
+def _split_df_by_users(df: pl.DataFrame, n: int) -> list:
+    """Split df into n roughly equal chunks by userId."""
+    all_users = df["userId"].unique(maintain_order=False).to_list()
+    chunk_size = max(1, math.ceil(len(all_users) / n))
+    return [
+        df.filter(pl.col("userId").is_in(all_users[i: i + chunk_size]))
+        for i in range(0, len(all_users), chunk_size)
+    ]
+
+
 def _compute_home_polars(df: pl.DataFrame) -> pl.DataFrame:
     """
     Home location: geohash7 with most total time spent.
@@ -841,6 +873,7 @@ def compute_all_polars(
     already_done_wrg: set,
     store: "ParquetStore",
     batch_size: int = 5000,
+    n_workers: int = 1,
 ) -> dict:
     """
     Vectorized replacement for ``compute_all()`` in pipeline.py.
@@ -866,6 +899,14 @@ def compute_all_polars(
         Output store.
     batch_size : int
         Maximum users per parquet shard write.  Larger = fewer shards.
+    n_workers : int
+        Number of parallel worker processes for the Python-heavy metrics
+        (real_entropy, S(t), Gonzalez) that use ``map_groups`` with a
+        Python callback and are therefore GIL-bound when run serially.
+        Polars expression-based metrics (group_by + agg) are always
+        parallel via polars' own thread pool regardless of this value.
+        ``1`` (default) runs everything in the main process.
+        Set to ``os.cpu_count()`` to saturate all available cores.
 
     Returns
     -------
@@ -900,14 +941,14 @@ def compute_all_polars(
 
     if cfg.get("is_radius_gyration") and not cfg.get("already_computed_rg"):
         rg = _compute_radius_of_gyration_polars(pending_df)
-        scalars = rg if scalars is None else scalars.join(rg, on="userId", how="outer")
+        scalars = rg if scalars is None else scalars.join(rg, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_random_entropy") and not cfg.get("already_computed_random_entropy"):
         ent = _compute_entropies_polars(pending_df)
         scalars = (
             ent.select(["userId", "random_entropy"])
             if scalars is None
-            else scalars.join(ent.select(["userId", "random_entropy"]), on="userId", how="outer")
+            else scalars.join(ent.select(["userId", "random_entropy"]), on="userId", how="full", coalesce=True)
         )
 
     if cfg.get("is_uncorrelated_entropy") and not cfg.get("already_computed_uncorrelated_entropy"):
@@ -916,28 +957,34 @@ def compute_all_polars(
             scalars = (
                 ent.select(["userId", "uncorrelated_entropy"])
                 if scalars is None
-                else scalars.join(ent.select(["userId", "uncorrelated_entropy"]), on="userId", how="outer")
+                else scalars.join(ent.select(["userId", "uncorrelated_entropy"]), on="userId", how="full", coalesce=True)
             )
 
     if cfg.get("is_real_entropy") and not cfg.get("already_computed_real_entropy"):
-        re_df = _compute_real_entropy_polars(pending_df)
-        scalars = re_df if scalars is None else scalars.join(re_df, on="userId", how="outer")
+        if n_workers > 1:
+            chunks = _split_df_by_users(pending_df, n_workers)
+            with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                parts = list(pool.map(_re_worker, chunks))
+            re_df = pl.concat([p for p in parts if not p.is_empty()])
+        else:
+            re_df = _compute_real_entropy_polars(pending_df)
+        scalars = re_df if scalars is None else scalars.join(re_df, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_distance") and not cfg.get("already_computed_distance"):
         dist = _compute_distance_polars(pending_df)
-        scalars = dist if scalars is None else scalars.join(dist, on="userId", how="outer")
+        scalars = dist if scalars is None else scalars.join(dist, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_fraction_time") and not cfg.get("already_computed_fraction_time"):
         q_df = _compute_fraction_time_polars(pending_df, period_start, period_end)
-        scalars = q_df if scalars is None else scalars.join(q_df, on="userId", how="outer")
+        scalars = q_df if scalars is None else scalars.join(q_df, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_home") and not cfg.get("already_computed_home"):
         home = _compute_home_polars(pending_df)
-        scalars = home if scalars is None else scalars.join(home, on="userId", how="outer")
+        scalars = home if scalars is None else scalars.join(home, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_krg") and not cfg.get("already_computed_krg"):
         krg = _compute_krg_polars(pending_df, K_RADIUS_VALUES)
-        scalars = krg if scalars is None else scalars.join(krg, on="userId", how="outer")
+        scalars = krg if scalars is None else scalars.join(krg, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_county_rural") and not cfg.get("already_computed_county_rural"):
         if scalars is not None and "home_lat" in scalars.columns:
@@ -988,7 +1035,15 @@ def compute_all_polars(
             ~pl.col("userId").cast(pl.Utf8).is_in(already_done_gonzalez)
         )
         if not pending_gonz.is_empty():
-            gonz_batch = _compute_gonzalez_polars(pending_gonz)
+            if n_workers > 1:
+                chunks = _split_df_by_users(pending_gonz, n_workers)
+                with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                    parts = list(pool.map(_gonz_worker, chunks))
+                gonz_batch: dict = {}
+                for d in parts:
+                    gonz_batch.update(d)
+            else:
+                gonz_batch = _compute_gonzalez_polars(pending_gonz)
             uids = list(gonz_batch.keys())
             for chunk_start in range(0, len(uids), batch_size):
                 chunk = {u: gonz_batch[u] for u in uids[chunk_start:chunk_start + batch_size]}
@@ -1002,7 +1057,15 @@ def compute_all_polars(
             ~pl.col("userId").cast(pl.Utf8).is_in(already_done_st)
         )
         if not pending_st.is_empty():
-            st_batch = _compute_st_polars(pending_st, t_threshold)
+            if n_workers > 1:
+                chunks = _split_df_by_users(pending_st, n_workers)
+                with ProcessPoolExecutor(max_workers=n_workers) as pool:
+                    parts = list(pool.map(_st_worker, [(c, t_threshold) for c in chunks]))
+                st_batch: dict = {}
+                for d in parts:
+                    st_batch.update(d)
+            else:
+                st_batch = _compute_st_polars(pending_st, t_threshold)
             uids = list(st_batch.keys())
             for chunk_start in range(0, len(uids), batch_size):
                 chunk = {u: st_batch[u] for u in uids[chunk_start:chunk_start + batch_size]}

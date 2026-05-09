@@ -318,6 +318,11 @@ class ParquetStore:
 
         frames: list[_pd.DataFrame] = []
         for uid, df in batch.items():
+            if not isinstance(df, _pd.DataFrame):
+                continue
+            _GON_COLS = {"x_norm", "y_norm", "sigmax", "sigmay"}
+            if not _GON_COLS.issubset(df.columns) or df.empty:
+                continue   # skip malformed / empty gonzalez frames
             sub = df[["x_norm", "y_norm", "sigmax", "sigmay"]].copy()
             sub["user_id"] = str(uid)
             frames.append(sub)

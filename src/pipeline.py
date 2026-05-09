@@ -123,13 +123,15 @@ def _run_user_worker(uid_str: str, user_df) -> dict:
 
     if cfg.get("is_gonzalez") and not cfg.get("already_computed_gonzalez") and raw:
         ciccio.compute_gonzalez()
-        if hasattr(ciccio, "df2save_gonzalez") and ciccio.df2save_gonzalez is not None:
-            import pandas as _pd
-            gdf = ciccio.df2save_gonzalez
-            if isinstance(gdf, dict):
-                gdf = _pd.DataFrame(gdf)
+        import pandas as _pd
+        gdf = getattr(ciccio, "df2save_gonzalez", None)
+        _GON_COLS = {"x_norm", "y_norm", "sigmax", "sigmay"}
+        if (
+            isinstance(gdf, _pd.DataFrame)
+            and not gdf.empty
+            and _GON_COLS.issubset(gdf.columns)
+        ):
             result["gonzalez"] = gdf
-
     if cfg.get("is_St") and not cfg.get("already_computed_St") and raw:
         ciccio.compute_St()
         if hasattr(ciccio, "df_St"):
@@ -221,7 +223,9 @@ def compute_all(
         ``1`` (default) runs serially.  Values ``> 1`` use
         ``ProcessPoolExecutor``; set to ``os.cpu_count()`` or a fraction
         thereof to saturate all available cores.  Only active in
-        ``raw_trajectories`` mode.  Ignored when ``use_vectorized=True``.
+        ``raw_trajectories`` mode.  In the vectorized path, used to
+        parallelize the GIL-bound ``map_groups`` metrics (real_entropy,
+        S(t), Gonzalez); polars expression metrics always use all threads.
     use_vectorized : bool
         When ``True``, bypass the per-user loop entirely and delegate to
         :func:`~src.vectorized_pipeline.compute_all_polars`.  Requires
@@ -276,7 +280,7 @@ def compute_all(
         return _vec_all(
             cfg, dataset, polars_df, period,
             ad_scalars, ad_gonzalez, ad_st, ad_freq, ad_wrg,
-            store, batch_size,
+            store, batch_size, n_workers,
         )
 
     # ── existing per-user path (unchanged) ──────────────────────────────
@@ -507,11 +511,14 @@ def compute_all(
         if cfg.get("is_gonzalez") and not cfg.get("already_computed_gonzalez") and raw:
             ciccio.compute_gonzalez()
             if store is not None and uid_str not in already_done_gonzalez:
-                if hasattr(ciccio, "df2save_gonzalez") and ciccio.df2save_gonzalez is not None:
-                    import pandas as _pd
-                    gdf = ciccio.df2save_gonzalez
-                    if isinstance(gdf, dict):
-                        gdf = _pd.DataFrame(gdf)
+                import pandas as _pd
+                gdf = getattr(ciccio, "df2save_gonzalez", None)
+                _GON_COLS = {"x_norm", "y_norm", "sigmax", "sigmay"}
+                if (
+                    isinstance(gdf, _pd.DataFrame)
+                    and not gdf.empty
+                    and _GON_COLS.issubset(gdf.columns)
+                ):
                     gonzalez_batch[uid_str] = gdf
 
         # S(t) (writes its own file in legacy mode; batched in store mode)
@@ -908,9 +915,11 @@ def analyze_from_s3_progressive(
             local_path.unlink(missing_ok=True)
             continue
 
-        # 3c. Compute metrics per period
-        try:
-            for period in df_info.period_names:
+        # 3c. Compute metrics per period — per-period try/except so one
+        #     failing period does NOT skip the remaining periods in the shard.
+        shard_had_error = False
+        for period in df_info.period_names:
+            try:
                 n_users = len(df_info.period2listusers[period])
                 dataset.period2totalusers[period] += n_users
                 if n_users == 0:
@@ -927,20 +936,31 @@ def analyze_from_s3_progressive(
                     n_workers=n_workers,
                     use_vectorized=use_vectorized,
                 )
-        except Exception as exc:
-            print(f"  WARNING: compute error — skipping shard.\n  {exc}")
-            local_path.unlink(missing_ok=True)
-            continue
+            except Exception as exc:
+                import traceback
+                print(
+                    f"  WARNING: compute error for period '{period}' — skipping period.\n"
+                    f"  {exc}\n"
+                    f"  {traceback.format_exc()}"
+                )
+                shard_had_error = True
+                continue
 
         # 3d. Delete local copy immediately to save disk space
         local_path.unlink(missing_ok=True)
-        print(f"  Local copy deleted.")
+        if shard_had_error:
+            print(f"  Local copy deleted (shard had partial errors — NOT marking as completed).")
+            # Do not add to completed_shards so the shard will be retried on the
+            # next run, potentially recovering users from periods that errored.
+        else:
+            print(f"  Local copy deleted.")
 
-        # 3e. Update shard checkpoint
-        completed_shards.add(shard_key)
-        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(checkpoint_path, "w") as _f:
-            json.dump({"completed": sorted(completed_shards)}, _f, indent=2)
+        # 3e. Update shard checkpoint (only for fully-clean shards)
+        if not shard_had_error:
+            completed_shards.add(shard_key)
+            checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(checkpoint_path, "w") as _f:
+                json.dump({"completed": sorted(completed_shards)}, _f, indent=2)
 
         # 3f. Periodic consolidation
         if (shard_idx + 1) % consolidate_every == 0:

@@ -851,3 +851,237 @@ class plotter:
                 dpi=200,
             )
             plt.show()
+
+    # ------------------------------------------------------------------
+    # Gap-analysis bridge methods (delegate to gap_analysis_plots.py)
+    # ------------------------------------------------------------------
+
+    def _load_scalars_all_periods(self) -> "dict[str, pd.DataFrame]":
+        """Return ``{period: scalar_df}`` for all periods (convenience helper)."""
+        return {p: self._load_scalars(p) for p in self.period_names}
+
+    def _build_week2rg_by_party(self) -> "dict[str, dict[str, list[float]]]":
+        """
+        Aggregate weekly RG values per week and per party across all periods.
+
+        Returns
+        -------
+        ``{iso_week_str: {party: [rg_values_metres]}}``
+        """
+        from .constants import PARTY_NAMES as _PARTY_NAMES
+        import polars as _pl
+
+        week2party: dict = {}
+
+        for p in self.period_names:
+            if self.store is not None:
+                scalars_pl = self.store.read_scalars(p)
+                wrg_pl     = self.store.read_weekly_rg_matrix(p)
+                if scalars_pl.is_empty() or wrg_pl.is_empty():
+                    continue
+                user_cols = [c for c in wrg_pl.columns if c != "week"]
+                wrg_long  = wrg_pl.unpivot(
+                    on=user_cols, index="week",
+                    variable_name="user_id", value_name="rg_value",
+                )
+                meta   = scalars_pl.select(["user_id", "party_government"])
+                joined = wrg_long.join(meta, on="user_id", how="left")
+                for row in joined.iter_rows(named=True):
+                    week = row["week"]
+                    rg   = row["rg_value"]
+                    pty  = row["party_government"]
+                    if rg is None or (isinstance(rg, float) and np.isnan(rg)):
+                        continue
+                    if pty not in _PARTY_NAMES:
+                        continue
+                    if week not in week2party:
+                        week2party[week] = {party: [] for party in _PARTY_NAMES}
+                    week2party[week][pty].append(rg)
+            else:
+                # Legacy file mode: pair weekly_rg JSON with scalar CSV
+                self._ensure("weekly_rg")
+                self._ensure("scalar")
+                for f_wrg in self.period2wrgusers_files.get(p, []):
+                    import os, json
+                    f_sc = f_wrg.replace("weekly_rg", "all_scalars").replace(".json", ".csv.gz")
+                    if not (os.path.isfile(f_wrg) and os.path.isfile(f_sc)):
+                        continue
+                    try:
+                        df_sc = pd.read_csv(f_sc, compression="gzip")
+                        pty   = df_sc["party_government"].iloc[0]
+                        with open(f_wrg) as fh:
+                            wrg = json.load(fh)
+                        for week, val in wrg.items():
+                            if isinstance(val, float) and np.isnan(val):
+                                continue
+                            if pty not in _PARTY_NAMES:
+                                continue
+                            if week not in week2party:
+                                week2party[week] = {party: [] for party in _PARTY_NAMES}
+                            week2party[week][pty].append(val)
+                    except Exception:
+                        continue
+
+        return week2party
+
+    def plot_gap1_npi_timeline(
+        self,
+        npi_events: "dict[str, object] | None" = None,
+        save: bool = True,
+    ) -> "plt.Figure":
+        """
+        Gap 1 – Causal framing.
+
+        Weekly mobility by party with NPI event dates overlaid, so the reader
+        can judge whether behavioural change preceded formal lockdown orders.
+
+        Parameters
+        ----------
+        npi_events:
+            Override the default event-date dict.  Keys are labels, values
+            are ``datetime.date`` objects.  Defaults to
+            ``gap_analysis_plots.NPI_EVENTS[self.region]``.
+        save:
+            If ``True`` the figure is written to the ``plots/`` directory.
+        """
+        from .gap_analysis_plots import plot_npi_timeline
+
+        week2party = self._build_week2rg_by_party()
+        out = (
+            self.dir_plot
+            / f"gap1_npi_timeline_{self.np_}_t_{self.t_threshold}_{self.region}.png"
+        ) if save else None
+
+        return plot_npi_timeline(
+            week2rg_by_party=week2party,
+            npi_events=npi_events,
+            region=self.region,
+            period_names=self.period_names,
+            period_division=self.period_division,
+            output_path=out,
+        )
+
+    def plot_gap2_sampling_bias(
+        self,
+        df_census: "pd.DataFrame | None" = None,
+        income_col: "str | None" = None,
+        save: bool = True,
+    ) -> "plt.Figure":
+        """
+        Gap 2 – Sampling bias.
+
+        Compare per-county user counts to census population to quantify
+        which counties and socioeconomic groups are over/under-represented.
+
+        Parameters
+        ----------
+        df_census:
+            DataFrame with ``county``, ``pop2023``, and optionally an income
+            or density column.  If ``None``, uses the project's built-in
+            ``df_rurality`` (which has ``pop2023`` and ``area`` columns)
+            merged with party information.
+        income_col:
+            Column name in ``df_census`` for median household income.
+        save:
+            If ``True`` the figure is written to the ``plots/`` directory.
+        """
+        from .gap_analysis_plots import (
+            plot_sampling_bias_coverage,
+            compute_users_per_county,
+        )
+
+        dfs = self._load_scalars_all_periods()
+        df_users = compute_users_per_county(dfs)
+
+        if df_census is None:
+            # Build a minimal census proxy from the rurality table
+            df_cen = self.df_rurality.copy()
+            # Normalise county column name
+            if "name" in df_cen.columns:
+                df_cen = df_cen.rename(columns={"name": "county"})
+            # Attach party info
+            county2party_s = pd.Series(self.county2party, name="party_government")
+            df_cen = df_cen.merge(
+                county2party_s.reset_index().rename(columns={"index": "county"}),
+                on="county", how="left",
+            )
+        else:
+            df_cen = df_census.copy()
+
+        out = (
+            self.dir_plot
+            / f"gap2_sampling_bias_{self.np_}_t_{self.t_threshold}_{self.region}.png"
+        ) if save else None
+
+        return plot_sampling_bias_coverage(
+            df_users_per_county=df_users,
+            df_census=df_cen,
+            income_col=income_col,
+            output_path=out,
+        )
+
+    def plot_gap3_party_rurality(
+        self,
+        metric: str = "radius_gyration",
+        save: bool = True,
+    ) -> "plt.Figure":
+        """
+        Gap 3 – Party / rurality conflation.
+
+        OLS regression and partial-correlation analysis that disentangles
+        the independent effects of party and rurality on ``metric``.
+
+        Parameters
+        ----------
+        metric:
+            Mobility metric column name (must be in the scalar parquet table).
+        save:
+            If ``True`` the figure is written to the ``plots/`` directory.
+        """
+        from .gap_analysis_plots import plot_party_rurality_regression
+
+        dfs = self._load_scalars_all_periods()
+        out = (
+            self.dir_plot
+            / f"gap3_party_rurality_{metric}_{self.np_}_t_{self.t_threshold}_{self.region}.png"
+        ) if save else None
+
+        return plot_party_rurality_regression(
+            dfs_by_period=dfs,
+            metric=metric,
+            output_path=out,
+        )
+
+    def plot_gap4_post_lockdown_asymmetry(
+        self,
+        metric: str = "radius_gyration",
+        save: bool = True,
+    ) -> "plt.Figure":
+        """
+        Gap 4 – Post-lockdown asymmetry.
+
+        Explicitly shows in Results how mobility change relative to the
+        pre-lockdown baseline differs between Democratic and Republican
+        counties across all three pandemic phases.
+
+        Parameters
+        ----------
+        metric:
+            Mobility metric column name (must be in the scalar parquet table).
+        save:
+            If ``True`` the figure is written to the ``plots/`` directory.
+        """
+        from .gap_analysis_plots import plot_post_lockdown_asymmetry
+
+        dfs = self._load_scalars_all_periods()
+        out = (
+            self.dir_plot
+            / f"gap4_post_lockdown_{metric}_{self.np_}_t_{self.t_threshold}_{self.region}.png"
+        ) if save else None
+
+        return plot_post_lockdown_asymmetry(
+            dfs_by_period=dfs,
+            metric=metric,
+            period_names=self.period_names,
+            output_path=out,
+        )

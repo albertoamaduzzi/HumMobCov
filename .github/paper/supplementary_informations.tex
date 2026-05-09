@@ -1,0 +1,208 @@
+\documentclass[main.tex]{subfiles}
+\begin{document}
+\label{supplementary_information}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{Massachusetts Analysis}
+
+\begin{minipage}[c]{\textwidth}
+    \centering
+    \begin{tabular}{|c|c|c|c|}
+    \hline
+    $Massachusetts$ & $N_m$ & $T_m$ & $\langle$ $T_m$ $\rangle_p$\\
+    15 January - 15 March    & 181778   & 28782953  & 158\\
+    15 March - 15 May    & 140913   & 12701431  & 90\\
+    15 May - September    & 141285   & 32096311 & 227 \\
+    \hline
+    \end{tabular}
+    \captionof{table}{Main information about the Massachusetts preprocessed dataset}
+\end{minipage}
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{cc}
+        \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/rg_20_hour_1.png}     & \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/distance_20_hour_1.png} 
+    \end{tabular} 
+      \caption{On the left: Distribution of radius of gyration among in three different periods. The lockdown curve is above the other two curves for distances below 5 km, and below up to 1000 km, meaning that medium-distance mobility is redistributed on the short-distance one, while preserving long-trip mobility. On the right: Distribution of distances among successive stop’ points in three different periods and their corresponding power laws prevalence of short distance travels and long tail can be observed.
+      Time threshold = 1 h }
+      \label{radg_and_dist}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{ccc}
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 jan - 15 march_20_hour_1_k_3.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 march - 15 may_20_hour_1_k_3.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 may - sept_20_hour_1_k_3.png} \\
+%        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 jan - 15 march_20_hour_1_k_10.png} &
+%        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 march - 15 may_20_hour_1_k_10.png} &
+%        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/v rg_krg_15 may - sept_20_hour_1_k_10.png}  
+    \end{tabular}
+    \caption{Distribution of (radius of gyration, k-radius of gyration) in three different periods. From top to bottom k = 3, 6, 10. From left to right period of measure (15 January - 15 March, 15 March - 15 May, 15 May - September). Time threshold = 1 hours}
+    \label{returner_explorers_massachusetts}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{ccc}
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/gonzalez_15 jan - 15 march_20_hour_1.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/gonzalez_15 march - 15 may_20_hour_1.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/gonzalez_15 may - sept_20_hour_1.png} \\
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/conditional_gonzalez_15 jan - 15 march_20_hour_1.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/conditional_gonzalez_15 march - 15 may_20_hour_1.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/conditional_gonzalez_15 may - sept_20_hour_1.png}
+    \end{tabular}
+    \caption{Distribution of positions of people stops' points in their intrinsic reference frames rescaled by the variance of the rotated coordinates in the x,y-rotated axes. From left to right, different periods (15 January - 15 March, 15 March - 15 May, 15 May - September). Bottom figures are the conditional probability fixing the coordinate y = 0. Case of time threshold of 1 hour}
+    \label{Gonzalez_massachusetts}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{ccc}
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/sigmaxy_15 jan - 15 march_20_hour_1.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/sigmaxy_15 march - 15 may_20_hour_1.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/sigmaxy_15 may - sept_20_hour_1.png}
+    \end{tabular}
+    \caption{Distribution of variances of trajectories stops' points in their intrinsic reference frames rescaled by the variance of the rotated coordinates in the x,y-rotated axes. From left to right, different periods (15 January - 15 March, 15 March - 15 May, 15 May - September). Time threshold of 1 hour.}
+    \label{sigma_massachusetts}
+\end{figure}
+
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{cc}
+    \includegraphics[width=0.45\textwidth]{figures/Supplementary_figures/St_different_periods_fit_20_hour_1.png} &   \includegraphics[width=0.45\textwidth]{figures/Supplementary_figures/rank_plot_20_hour_1.png} 
+    \end{tabular}
+    \caption{On the left: Average number of stop points visited in time. During lockdown, the rate of discovery is lower than the other two periods. On the right: Distribution of frequency of visits of first 10 preferred places for each user. During lockdown: the first two ranked visited places occupy 66 \%of the visitation pattern, against 50 \% of the before and after periods. Case of time threshold of 1 hour}
+    \label{visitation_increase-frequency_massachusetts}
+\end{figure}
+
+\begin{table}[h]
+    \begin{center}
+    \caption{}\label{no_change_home_massachusetts}%
+    \begin{tabular}{|c|c|c|c|}
+    \hline
+     & 15 January - 15 March & 15 March - 15 May & 15 May - September\\
+    15 January - 15 March    & 1   & 0.8  & 0.8  \\
+    15 March - 15 May    &   &  1  & 0.5  \\
+    15 May - September    &  &   & 1  \\
+    \hline
+    \end{tabular}
+    \footnotetext{Fraction of people in Massachusetts of the first period of comparison, maintain the most visited place in the following periods}
+    \end{center}
+\end{table}
+
+\begin{figure}[h]
+    \begin{tabular}{cc}
+    \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/rdm_entropy_three_periods.png} &
+    \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/uncorr_entropy_three_periods.png}\\ \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/real_entropy_three_periods.png}   
+    %&  \includegraphics[width=0.5\textwidth]{compression_rate_15 may - sept (3).png}
+    \\
+    
+    \end{tabular}
+    \caption{Distribution (from left to right, top to bottom). Random entropy, Uncorrelated entropy, Real entropy: during lockdown, the distributions are moved on the left with respect to the other two periods, indicating, in all three cases, less complexity. On the bottom right is shown the ratio between Random and Real entropy. This plot highlights that during lockdown restrictions, real entropy is closer to the random with respect to the other periods. This means that even though all three measures suggest that the complexity of the trajectories is smaller during lockdown, the main contribution to complexity (uncertainty) relies on the total number of visited places. }
+    \label{entropic_measures_massachusetts}
+\end{figure}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\section*{Stability analysis}
+\label{secA1}
+
+\begin{table}[h]
+    \begin{center}
+    \caption{}\label{no_change_home_massachusetts_8}%
+    \begin{tabular}{|c|c|c|c|}
+    \hline
+     & 15 January - 15 March & 15 March - 15 May & 15 May - September\\
+    15 January - 15 March    & 1   & 0.6  & 0.6  \\
+    15 March - 15 May    &   &  1  & 0.4  \\
+    15 May - September    &  &   & 1  \\
+    \hline
+    \end{tabular}
+    \footnotetext{Fraction of people of the first that maintain the most visited place during the following periods}
+    \end{center}
+\end{table}
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{cc}
+    \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/rg_20_hour_8.png}     & \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/distance_20_hour_8.png} 
+    \end{tabular} 
+    \caption{On the left: Distribution of radius of gyration among three different periods. On the right: Distribution of distances among successive stop points in three different periods and their corrective power laws. Time threshold = 8 h }
+    \label{radg and dist 8}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{ccc}
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 jan - 15 march_20_hour_8_k_3.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 march - 15 may_20_hour_8_k_3.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 may - sept_20_hour_8_k_3.png} \\
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 jan - 15 march_20_hour_8_k_6.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 march - 15 may_20_hour_8_k_6.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 may - sept_20_hour_8_k_6.png} \\
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 jan - 15 march_20_hour_8_k_10.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 march - 15 may_20_hour_8_k_10.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/rg_krg_15 may - sept_20_hour_8_k_10.png}  
+        \end{tabular}
+    \caption{Distribution of (radius of gyration, k-radius of gyration) in three different periods. From top to bottom k = 3, 6, 10. From left to right, period of measure (15 January - 15 March, 15 March - 15 May, 15 May - September). Time threshold = 8 hours}
+    \label{returner explorers 8}
+\end{figure}
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{ccc}
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/gonzalez_15 jan - 15 march_20_hour_8.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/gonzalez_15 march - 15 may_20_hour_8.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/gonzalez_15 may - sept_20_hour_8.png} \\
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/conditional_gonzalez_15 jan - 15 march_20_hour_8.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/conditional_gonzalez_15 march - 15 may_20_hour_8.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/conditional_gonzalez_15 may - sept_20_hour_8.png}
+    \end{tabular}
+    \caption{Distribution of positions of people stops' points in their intrinsic reference frames re-scaled by the variance of the rotated coordinates in the x,y-rotated axes.From left to right, different periods (15 January - 15 March, 15 March - 15 May, 15 May - September). Bottom figures are the conditional probability fixing the coordinate y = 0. Case of time threshold of 8 hours.}
+    \label{Gonzalez8}
+\end{figure}
+
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{ccc}
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/sigmaxy_15 jan - 15 march_20_hour_8.png} &    \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/sigmaxy_15 march - 15 may_20_hour_8.png} &
+        \includegraphics[width=0.3\textwidth]{figures/Supplementary_figures/sigmaxy_15 may - sept_20_hour_8.png} 
+    \end{tabular}
+    \caption{Distribution of variances of trajectories stops' points in their intrinsic reference frames re-scaled by the variance of the rotated coordinates in the x,y-rotated axes. From left to right, different periods (15 January - 15 March, 15 March - 15 May, 15 May - September).  time threshold of 8 hours.}
+    \label{sigma8}
+\end{figure}
+
+
+\begin{figure}[h]
+    \centering
+    \begin{tabular}{cc}
+        \includegraphics[width=0.45\textwidth]{figures/Supplementary_figures/St_different_periods_fit_20_hour_8.png} &   \includegraphics[width=0.45\textwidth]{figures/Supplementary_figures/rank_plot_20_hour_8.png} 
+    \end{tabular}
+    \caption{On the left: Average number of stop points visited in time. On the right: Distribution of frequency of visits of first ten preferred places for each user. Case of time threshold of 8 hours.}
+    \label{visitation increase-frequency 8}
+\end{figure}
+
+\begin{figure}[h]
+    \begin{tabular}{cc}
+        \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/rdm_entropy_three_periods_8.png} &
+        \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/uncorr_entropy_three_periods_8.png} \\ \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/real_entropy_three_periods_8.png} &  
+        \includegraphics[width=0.5\textwidth]{figures/Supplementary_figures/compression_rate_15 may - sept _8.png} \\
+    \end{tabular}
+    \caption{Distribution (from left to right) of random, uncorrelated and real entropy. On the bottom: compression rate. Time threshold of 8 hours}
+    \label{entropic_measures8}
+\end{figure}
+
+
+
+\end{document}
+

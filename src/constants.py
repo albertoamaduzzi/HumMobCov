@@ -63,6 +63,42 @@ DIR_SHARD_TEMP = Path(
     _os.environ.get("SHARD_TEMP_DIR", str(PROJECT_ROOT / ".shard_tmp"))
 )
 
+# ---------------------------------------------------------------------------
+# S3 output paths — final_pipeline output folder
+# ---------------------------------------------------------------------------
+# All computed results (parquet store, transition matrices, …) are
+# synchronised here after local computation.  The folder name
+# ``final_pipeline`` is intentionally distinct from all previous pipeline
+# versions so it is easy to identify.
+#
+# Override via environment variables to change bucket / prefix:
+#   S3_OUTPUT_BUCKET     (defaults to S3_BUCKET)
+#   S3_OUTPUT_PREFIX_CA
+#   S3_OUTPUT_PREFIX_MA
+# ---------------------------------------------------------------------------
+S3_OUTPUT_BUCKET: str = _os.environ.get("S3_OUTPUT_BUCKET", "chub-datalake")
+
+S3_OUTPUT_PREFIX: dict[str, str] = {
+    "CA": _os.environ.get(
+        "S3_OUTPUT_PREFIX_CA",
+        "shared/cuebiq/MOBS/final_pipeline/CA",
+    ),
+    "MA": _os.environ.get(
+        "S3_OUTPUT_PREFIX_MA",
+        "shared/cuebiq/MOBS/final_pipeline/MA",
+    ),
+}
+
+# Sub-prefix for transition matrices within final_pipeline/
+S3_TRANSITION_PREFIX: dict[str, str] = {
+    region: f"{prefix}/transition_matrices"
+    for region, prefix in S3_OUTPUT_PREFIX.items()
+}
+
+# Whether to upload computed results to S3 by default.
+# Set S3_UPLOAD_DEFAULT=0 to keep results local only.
+S3_UPLOAD_DEFAULT: bool = _os.environ.get("S3_UPLOAD_DEFAULT", "1") != "0"
+
 del _os
 
 # External library path

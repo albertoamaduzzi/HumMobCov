@@ -1,0 +1,178 @@
+\documentclass[main.tex]{subfiles}
+\begin{document}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection*{Notations}
+\label{notations}
+
+In this section, we introduce the objects we are going to work with and the summary of the notation in \ref{tab:standard_definitions} that are going to hold throughout the work.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% People
+We call Users the set of people under study we index them with greek letters ($\alpha$,$\beta$).
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Geometry
+We call grid the geometry of squared $N_{grid}$ cells  defined by geohash 7 tiling with side size $L_{cell} = 70$ m, we index each cell with roman letters i,j,k. 
+We therefore denote a single cell of the grid as $g_i$.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Stop point
+A stop point ($sp_t^{\alpha}$) is a couple of coordinates  $(lat^{\alpha}_t,lon^{\alpha}_t)$ and a starting (t) and ending time ($\hat{t}$) such that the mobile phone's signal remains within a cell of the grid for a minimum duration of $t^{sp}$ 10 minutes: $\hat{t} - t > t^{sp}$. We consider the time of the stop point as the beginning of the stop.
+We denote stay time $\delta t_{t} = \hat{t} - t$ and is variable in a trajectory.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Trajectories
+To each user it is associated a trajectory. A trajectory  $traj^\alpha$ is a succession of $N^{\alpha}$ stop points distributed in time $T^{\alpha} = \{t_{\tau}: \tau = 0,1,..,N^{\alpha}\}$ and the time duration of the trajectory is $|T^{\alpha}| = t_{N^{\alpha}}-t_0$. We define trajectories in three equivalent ways as,
+%
+\begin{itemize}
+    \item $traj^{\alpha} = \{sp^{\alpha}_t\}_{t \in T^{\alpha}}$ (succession of lat lon)
+    \item $traj^{\alpha} = \{g^{\alpha}_{it}\}_{t \in T^{\alpha}}$ (succession of cells)
+    \item $traj^{\alpha} = \{(x^{\alpha}_t,y^{\alpha}_t)\}_{t \in T^{\alpha}}$ (succession of points in the tangent space).
+\end{itemize}
+%
+We call $Trajs = \{traj_{\alpha}\}_{\alpha \in Users}$ the set of trajectories.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% time intervals and split into epochs
+Each trajectory is characterized with an interval $[t_{start}^{\alpha},t_{end}^{\alpha}]$ that is contained in the overall period of study $[T_{start} = 15/01/2020,T_{end} = 01/09/2020]$.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% covid epochs
+We futher divide the overall period into three different periods representing different stages of lockdown restrictions that we index with suffixes $\{pre,during,post\}$ and generically referred to with suffix p.
+
+This partition is defined by the time intervals $\{[T^{pre}_{start} = 15/01/2020,T^{pre}_{end} = 15/03/2020],[T^{during}_{start} = 15/03/2020,T^{during}_{end} = 15/05/2020],[T^{post}_{start} = 15/05/2020,T^{post}_{end} = 01/09/2020]\}$ and induces a partition in the set of users that we call $\{Users^{pre},Users^{during},Users^{post}\}$ with the condition for a user to belong to a certain class is that $t_{end}^{\alpha} \le T^{p}_{end}$.
+
+In the case user $\alpha$ spans multiple periods, the trajectory is cut into multiple sub-trajectories, and each sub-trajectory is considered for the different partition $Users^{p}$.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Filtering
+We also define a time burst filter $t^{burst}$ as the minimum time interval within two successive stop points.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Distance
+We define as the geodesic distance $d_g(\Vec{x},\Vec{y})$ between two points $\Vec{x}$,$\Vec{y}$.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Mobility network
+In the end we define the mobility network of user $\alpha$ as $G^{\alpha} = (N^{\alpha},E^{\alpha})$.
+This is a weighted directed graph where the nodes (n) are the stop points, while the edges (e) are the transitions between successive stop points and the weight $w_{e}$ is the number of time such transition happened . The graph is naturally loop-less. We call $k^{\alpha,in}_n$ the number of time node n is visited.
+%
+\begin{table}[h!]
+    \centering
+    \begin{tabular}{|c|c|}
+        \hline
+        % grid
+        $grid$, (i,j,k) &  set of cells geohash 7, (indices) \\
+        \hline
+        $d_{g}(\Vec{x},\Vec{y})$ &  geodesic distance between two points $\Vec{x}$ and $\Vec{y}$\\
+        \hline
+        % Users & Trajs (not conditioned)
+        Users & Set of people \\
+        \hline
+        $Trajs$ &  Set of all trajectories \\
+        \hline
+        $(\alpha,\beta)$ & index user \\
+        \hline
+        % Trajectories components
+        $l^{\alpha}$ & length of the trip user $\alpha$ \\
+        \hline
+        % Time 
+        $T^{\alpha}$ & set of times for each stop point for trajectory $\alpha$\\
+        \hline
+        $|T^{\alpha}|$ & time duration for trajectory $\alpha$\\
+        \hline
+
+        $T_{start}$,$T_{end}$ & start and end time analysis \\
+        \hline
+        $T^{p}_{start}$,$T^{p}_{end}$ & start and end time of period p \\
+        \hline
+        $t_{start}^{\alpha}$,$t_{end}^{\alpha}$ & start and end time user $\alpha$ \\
+        \hline
+        $\tau$ & integer index time of a stop point in a trajectory \\
+        \hline
+        % filters time
+        $t^{sp} (=10 min)$ & interval definition stop point\\
+        \hline
+        $\delta t_{t}$ & duration of $sp_{t}$\\
+        \hline
+        % Users and Trajs (condtioned)
+        $Users^{p}$ & Set of people per period p \\
+        \hline
+        $Trajs^{p}$ &  Set of all trajectories per period p \\
+        \hline
+    \end{tabular}
+    \caption{Standard Definitions}
+    \label{tab:standard_definitions}
+\end{table}
+%
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection*{Data}
+\label{dataset}
+
+Cuebiq Inc. provided the human mobility data used here for research purposes. This data was collected from anonymous mobile phone users who have opted-in to give access to their location data anonymously, through a GDPRcompliant framework. Researchers queried the mobility data through an auditable, cloud-hosted sandbox environment, receiving aggregate outputs in return. The datasets contain records of people living in California and Massachusetts from January 2021 to the end of September 2021. The former dataset is described in Tab.\ref{tabPeopleCal} total, we have over 17.8 billion. Given the unique nature of the data used in this study (enhanced mobile phone data collected by Cuebic, characterized by concentrated bursts of data collection within short time windows), it was necessary to implement a burst filtering process in order to ensure consistency in the acquisition of positional data. Specifically, the filter imposes that $\forall traj_{\alpha} \in Trajs, \forall sp_{t_{\tau}},sp_{t_{\tau + 1}} \in traj_{\alpha} $ that $t_{\tau + 1} - t_{\tau} > t^{burst}$, that is, two successive stop points are futher apart in time of at least $t^{burst}$. In this discussion, $t^{burst} = 1$ hour; however, alternative threshold values of 8 and 24 hours were also applied and are available in the Appendix for reference. We note here that the duration time $\delta t_{t_{\tau}}$ for a stop point is not the time between two successive stop points $sp_{t_{\tau}},sp_{t_{\tau + 1}}$ after the introduction of burst filter.
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+\subsection*{Metrics}
+
+We examine various measures that emphasize distinct types of comprehension, including geometric, information-theoretic, and visitation patterns. For starters, we have used a modified version of the radius of gyration and shown in \ref{rg}. This measures the radius within which a person is most probable to be found from the center of mass at time t. The essential modification is that each stop point is weighted by the time of stay. So the biggest is the stay, the biggest is the contribution to the radius, as can be seen in (fig. \ref{rg}).
+%
+\begin{equation}
+     R^{\alpha}_{g} = \sqrt{\frac{1}{|T^{\alpha}|} \sum_{t=0}^{t_{N^{\alpha}}}d_{g}(\Vec{x^{\alpha}_{t}},\Vec{x^{\alpha}_{cm,t}})^2\delta t_{t}}
+     \label{rg}
+\end{equation}
+%
+where $|T^{\alpha}|$ is the total time duration of the trajectory for person $\alpha$, $\delta t_{t}$ is the time spent at stop point of coordinates $\Vec{x_{t}}$ and $\Vec{x^{\alpha}_{cm,t}}$ is the center of mass for the trajectory up to time t.  The distance straight line is the geodesic distance on the earth. Another quantity that expresses geometric information is the distribution of stop points in trajectories in their intrinsic reference frame re-scaled by the variances on the principal axis. The procedure to calculate such quantity is shown in (alg.\ref{phi}). 
+%
+\begin{equation}
+    $\bold{for}$ i in people\\
+    {
+    \{$x_i^\alpha \gets lat_i^\alpha$;\\
+    $y_i^\alpha \gets lon_i^\alpha$;\\
+    $I_{i(xy)} \gets $ inertia tensor;\\
+    $diag(I_{i(xy)}) \gets O_i^{-1}I_{i(xy)}O_i$;\\
+    $(x_i^{'\alpha},y_i^{'\alpha}) \gets O_i(x_i^{\alpha},y_i^{\alpha})$;\\
+    $(\sigma_{x'i},\sigma_{y'i}) \gets \sum_{\alpha}{(x_i^{'\alpha}-x'_{icm})^2 + (y_i^{'\alpha}-y'_{icm})^2}$
+    \}\\
+    Calculate probability distribution on $(\frac{x_i'}{\sigma_{xi}'},\frac{y_i'}{\sigma_{yi}'})$
+    }
+    \caption{Calculation distribution of positions in intrinsic reference frame}\label{phi}
+\end{equation}
+%
+We also measured the curve of newly visited places in time and the average frequency of the ten most frequented places per person, shown in figure \ref{visitation increase-frequency}.
+Let be $r$ denote the ranking $r = 1,...,10$. The latter case refers to the formula \ref{k_avg}.
+%
+\begin{equation}
+    \langle k \rangle^{r,p} =  \langle \frac{k^{\alpha,r}}{\sum_{r = 1}^{min(10,r_{max})}k^{\alpha,r}} \rangle_{{\alpha} \in {trajs^p}}
+    \label{k_avg}
+\end{equation}
+%
+Here, \( p \) denotes the time period, \( r \) represents the rank of a node in an individual’s mobility network (with \( r = 1 \) being the most visited location), and \( k^{\alpha, r} \) is the number of trips made by individual \( \alpha \) to the node of rank \( r \). The distribution is computed separately for each period \( p \), considering only the individuals active during that period.
+
+This metric captures how the frequency of visits to the most important locations changes across the population over different time periods.
+In the end, we calculated entropic measures that quantify the degree of uncertainty of the trajectories in three different ways: \ref{rdm_entropy} and \ref{unc_entropy}.
+%
+\begin{equation}
+    H_{random} = \log_2 n \label{rdm_entropy}
+\end{equation}
+%
+\begin{equation}
+    H_{uncorrelated} = -\sum_{i=1}^n p_i \log_2 p_i
+    \label{unc_entropy}
+\end{equation}
+%
+\begin{equation}
+H_{Real} = (\frac{1}{T}\sum_{t=1}^{T} \Lambda_t)^{-1} \log_2 T
+    \label{real_entropy}
+\end{equation}
+%
+The Random entropy, which depends on the number of visited places, the Shannon, which adds the dependency on the relative frequency of visits, assuming subsequent visits are independent, and eventually Lempel-Ziv estimation (Real entropy), which also considers the order in which visits are done. In particular, Lempel-Ziv provide data compression algorithm and an estimator that converges to the real entropy of a time series. $\Lambda$i is the length of the shortest substring (succession of stop points) starting at position t which doesn't previously appear from position 1 to t - 1  \cite{Lempel-Ziv}. These different measures allow a progressively finer view of the trajectories, adding different aspects that contribute to the description of the complexity of a single path. The k-radius of gyration is instead the radius of gyration that considers just the k-most visited places in the computation.
+
+
+
+\end{document}
+

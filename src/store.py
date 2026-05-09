@@ -977,6 +977,237 @@ class ParquetStore:
         if verbose:
             print("\nMA migration complete.")
 
+    # ------------------------------------------------------------------
+    # S3 synchronisation
+    # ------------------------------------------------------------------
+
+    def upload_file_to_s3(
+        self,
+        local_path: Path,
+        s3_bucket: str,
+        s3_key: str,
+        endpoint_url: str,
+        delete_after: bool = True,
+    ) -> bool:
+        """
+        Upload a single local file to an S3-compatible store.
+
+        Uses the ``aws s3 cp`` CLI (same credentials / endpoint as the
+        download path in ``analyze_from_s3_progressive``).
+
+        Parameters
+        ----------
+        local_path : Path
+            The file to upload.  Must exist.
+        s3_bucket : str
+            Destination bucket (e.g. ``"chub-datalake"``).
+        s3_key : str
+            Full key inside the bucket (e.g.
+            ``"shared/cuebiq/MOBS/final_pipeline/CA/all_scalars_.../consolidated.parquet"``).
+        endpoint_url : str
+            S3-compatible endpoint (e.g. ``"https://s3.atlas.fbk.eu"``).
+        delete_after : bool
+            If True *and* the upload succeeded, delete the local file.
+
+        Returns
+        -------
+        bool
+            True on success, False on failure (local file is kept on failure).
+        """
+        import subprocess as _sp
+
+        if not local_path.exists():
+            print(f"  [S3 upload] File not found, skipping: {local_path}")
+            return False
+
+        s3_uri = f"s3://{s3_bucket}/{s3_key}"
+        result = _sp.run(
+            [
+                "aws", "s3", "cp",
+                str(local_path),
+                s3_uri,
+                "--endpoint-url", endpoint_url,
+            ],
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            print(
+                f"  [S3 upload] FAILED {local_path.name} → {s3_uri}\n"
+                f"  stderr: {result.stderr.strip()}"
+            )
+            return False
+
+        if delete_after:
+            local_path.unlink(missing_ok=True)
+        return True
+
+    def upload_period_to_s3(
+        self,
+        period: str,
+        s3_bucket: str,
+        s3_prefix: str,
+        endpoint_url: str,
+        delete_after: bool = True,
+        consolidate_first: bool = True,
+        verbose: bool = True,
+    ) -> dict[str, bool]:
+        """
+        Upload all consolidated parquet files for ``period`` to S3.
+
+        The remote key layout mirrors the local shard-directory names::
+
+            {s3_prefix}/{kind}_period_{period}_np_{np_}_t_{t}/consolidated.parquet
+
+        Parameters
+        ----------
+        period : str
+            Period name (e.g. ``"15 jan - 15 march"``).
+        s3_bucket : str
+            Destination bucket.
+        s3_prefix : str
+            Prefix inside the bucket
+            (e.g. ``"shared/cuebiq/MOBS/final_pipeline/CA"``).
+        endpoint_url : str
+            S3-compatible endpoint URL.
+        delete_after : bool
+            Delete the local file after a successful upload.
+        consolidate_first : bool
+            Run ``consolidate_all(period)`` before uploading.
+        verbose : bool
+            Print progress messages.
+
+        Returns
+        -------
+        dict[str, bool]
+            ``{kind: success}`` mapping.
+        """
+        if consolidate_first:
+            self.consolidate_all(period)
+
+        results: dict[str, bool] = {}
+        for kind in list(FIXED_LENGTH_KINDS) + list(LONG_FORMAT_KINDS):
+            cp = self._consolidated_path(period, kind)
+            if not cp.exists():
+                continue
+
+            # Mirror the local directory name on S3
+            shard_dir_name = cp.parent.name  # e.g. all_scalars_period_…
+            s3_key = f"{s3_prefix}/{shard_dir_name}/{CONSOLIDATED_FNAME}"
+
+            if verbose:
+                print(f"  Uploading [{kind}] {period!r} → s3://{s3_bucket}/{s3_key} …")
+
+            ok = self.upload_file_to_s3(
+                cp, s3_bucket, s3_key, endpoint_url,
+                delete_after=delete_after,
+            )
+            results[kind] = ok
+            if verbose:
+                status = "OK" if ok else "FAILED (local copy kept)"
+                print(f"    {status}")
+
+        return results
+
+    def upload_all_to_s3(
+        self,
+        period_names: list[str],
+        s3_bucket: str,
+        s3_prefix: str,
+        endpoint_url: str,
+        delete_after: bool = True,
+        consolidate_first: bool = True,
+        verbose: bool = True,
+    ) -> dict[str, dict[str, bool]]:
+        """
+        Upload all periods to S3.
+
+        Parameters
+        ----------
+        period_names : list[str]
+            Periods to upload (typically ``PERIOD_NAMES``).
+        s3_bucket : str
+            Destination bucket.
+        s3_prefix : str
+            Prefix inside the bucket.
+        endpoint_url : str
+            S3-compatible endpoint URL.
+        delete_after : bool
+            Delete local files after successful upload.
+        consolidate_first : bool
+            Consolidate shards before uploading.
+        verbose : bool
+
+        Returns
+        -------
+        dict[str, dict[str, bool]]
+            ``{period: {kind: success}}`` nested mapping.
+        """
+        all_results: dict[str, dict[str, bool]] = {}
+        for period in period_names:
+            if verbose:
+                print(f"\nUploading period: {period!r} …")
+            all_results[period] = self.upload_period_to_s3(
+                period=period,
+                s3_bucket=s3_bucket,
+                s3_prefix=s3_prefix,
+                endpoint_url=endpoint_url,
+                delete_after=delete_after,
+                consolidate_first=consolidate_first,
+                verbose=verbose,
+            )
+        if verbose:
+            print("\nS3 upload complete.")
+        return all_results
+
+    def list_s3_computed_periods(
+        self,
+        s3_bucket: str,
+        s3_prefix: str,
+        endpoint_url: str,
+    ) -> list[str]:
+        """
+        List period names that already have consolidated data on S3.
+
+        Runs ``aws s3 ls`` to inspect the remote prefix and parses the
+        directory names back to period strings.
+
+        Returns
+        -------
+        list[str]
+            Period names found on S3 (subset of ``PERIOD_NAMES``).
+        """
+        import subprocess as _sp
+        import re as _re
+
+        s3_uri = f"s3://{s3_bucket}/{s3_prefix}/"
+        result = _sp.run(
+            ["aws", "s3", "ls", s3_uri, "--endpoint-url", endpoint_url],
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            return []
+
+        found: set[str] = set()
+        period_pat = _re.compile(
+            r"all_scalars_period_(.+?)_np_\d+_t_\d+/?$"
+        )
+        for line in result.stdout.splitlines():
+            parts = line.strip().split()
+            if not parts:
+                continue
+            name = parts[-1].rstrip("/")
+            m = period_pat.search(name)
+            if m:
+                # Reverse _safe_period encoding
+                period_safe = m.group(1)
+                period = period_safe.replace("_", " ")
+                found.add(period)
+
+        return sorted(found)
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers

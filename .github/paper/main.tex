@@ -1,0 +1,92 @@
+\documentclass[9pt]{article}
+
+\usepackage[margin=0.9in]{geometry}
+\usepackage[english]{babel}
+\usepackage[utf8]{inputenc}
+\usepackage{subfiles}
+\usepackage{graphicx}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{soul}
+\usepackage{color}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{tikz}
+\usetikzlibrary{shapes}
+\usepackage{authblk}
+\usepackage[nottoc]{tocbibind}
+\usepackage{mathrsfs}
+\usepackage{multirow}
+\usepackage{diagbox}
+\usepackage{xcolor}
+
+
+\usepackage{colortbl}    % enables \rowcolor and \cellcolor
+\usepackage{float}
+
+\definecolor{figblue}{RGB}{31,119,180}
+\definecolor{figorange}{RGB}{255,127,14}
+\definecolor{figgreen}{RGB}{44,160,44}
+
+\title{Human mobility in the COVID-19 era: a quantitative analysis}
+
+\author[1,2]{Alberto Amaduzzi \thanks{alberto.amaduzzi3@unibo.it}}
+\author[2]{Lucila G. Alvarez-Zuzek}
+\author[3]{Valeria d'Andrea}
+%\author[2]{Simone Centellegher}
+%\author[2]{Lorenzo Lucchini}
+%\author[2]{Filippo Privitera}
+%\author[2]{Manlio De Domenico}
+%\author[2]{Bruno Lepri}
+\author[4]{Marta C. Gonzalez}
+\author[1]{Armando Bazzani}
+\author[2]{Riccardo Gallotti}
+
+\affil[1]{Department of Physics, University of Bologna, Bologna, Italy}
+\affil[2]{Complex Human Behaviour Laboratory, Fondazione Bruno Kessler, Trento, Italy}
+\affil[3]{Department of Physics and Astronomy \'Galileo Galilei', University of Padua, Padova, Italy}
+\affil[4]{Department of Civil and Environmental Engineering, University of California, Berkeley, USA}
+
+%\affil[2]{Mobile and Social Computing Laboratory, Fondazione Bruno Kessler, Trento, Italy}
+%\affil*[4]{\orgdiv{Cuebiq Inc.}, \city{New York}, \state{NY}, \country{USA}}
+%\affil*[5]{\orgdiv{Department of Civil and Environmental Engineering}, \orgname{University of California}, \city{Berkeley}, \state{CA}, \country{USA}}
+
+\begin{document}
+
+    \maketitle
+    
+    \begin{abstract}
+        The unprecedented COVID-19 pandemic we all witnessed highlighted the critical role played by human interactions in the spread of a new disease. Severe social-distancing measures —such as lockdown restrictions and travel bans— had proven to be effective in limiting the impact of the pandemic. Characterising how human mobility flows changed during this period is crucial for developing mitigation strategies and preparing for future outbreaks. As scientists, this scenario also provided a natural experiment to understand and quantify how human mobility patterns changed as a consequence of non-pharmaceutical interventions and test their resilience after these forced behaviours were lifted. Here, we analyse a large privacy-enhanced longitudinal GPS dataset, including the trajectories of over 180,000 anonymous opted-in mobile app users living in Massachusetts and over 1,000,000 users living in California, and consider their movements across the U.S.A from January to September 2020. Our methodology replicates the analyses and measures from seminal works on the statistical description of human mobility, which, in aggregated form, appear only slightly modified despite the major shock that lockdowns represented for individuals. During lockdown, people not only travelled less but also stayed closer to home, with a prevalence of shorter trips and reduced exploration. Though the number of different visited locations decreased as people were restricted to fewer places, the complexity of individual behaviour remained stable. Any increased predictability of movement patterns can be directly attributed to the reduced number of visited locations. Post-lockdown recovery varied between counties, with a faster recovery of mobility (measured by the radius of gyration) among citizens living in rural areas and those residing in counties governed by the Republican Party. Our findings reveal that while COVID-19 restrictions significantly altered spatial mobility patterns, the fundamental characteristics of human movements remained resilient, and provide useful insights for the development of intervention strategies that account for regional socio-political factors and urban-rural disparities in behavioural adaptation during future public health emergencies.
+    \end{abstract}
+
+    \newpage
+    
+    \section*{Introduction}
+        \subfile{introduction}
+
+    \section*{Results}
+        \subfile{results}
+
+    \section*{Discussion}
+        \subfile{discussion}
+
+    \section*{Materials and Methods}
+        \subfile{methods}
+
+    \section*{Acknowledgements}
+    
+    The authors are grateful to Manlio De Domenico for their valuable input and thoughtful discussions during the early stages of this work, and to Filippo Privitera from Cuebiq Inc. for enabling the collection of the dataset analysed.
+    
+    \section*{Declarations}
+    The authors declare no conflict of competing interests.    
+
+    \newpage
+    \bibliographystyle{unsrt}
+    \bibliography{bibliography}
+    
+    \newpage    
+    \section*{Supplementary Information}
+       \subfile{supplementary_information}
+
+\end{document}
+

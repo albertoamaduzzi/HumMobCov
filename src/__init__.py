@@ -121,6 +121,10 @@ from .pipeline  import (          # noqa: F401
     analyze_from_s3_progressive,
     get_config,
 )
+from .vectorized_pipeline import (  # noqa: F401
+    preprocess_shard_polars,
+    compute_all_polars,
+)
 from .plotter   import plotter    # noqa: F401
 from .store     import (          # noqa: F401
     ParquetStore,

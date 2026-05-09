@@ -18,10 +18,15 @@ HumMobCov/
 │   ├── constants.py        # all paths, period defs, parameter values
 │   ├── datasets.py         # DataSet_California / DataSet_Massachusets
 │   ├── pipeline.py         # per-user computation orchestrators
-│   ├── User.py             # individual mobility metric computation
+│   ├── vectorized_pipeline.py        # polars/numba vectorized replacement
+│   ├── User.py             # individual mobility metric computation (legacy)
 │   ├── store.py            # columnar parquet storage layer (ParquetStore)
 │   ├── plotter.py          # all statistical visualisations
 │   ├── utils.py            # shared helpers (filter_, xy, t_stop, …)
+│   ├── tile_counties_via_geohash.py  # geohash grid tiling for counties
+│   ├── transition_matrices/          # transition & presence matrix pipeline
+│   │   ├── __init__.py
+│   │   └── transition_pipeline.py   # TransitionPipeline class
 │   ├── rg_fits.py          # power-law / fit utilities
 │   ├── rg_histograms.py    # histogram helpers
 │   ├── rg_mobility_maps.py # geo-map plotting
@@ -33,32 +38,24 @@ HumMobCov/
 ├── census_data/            # shapefiles, density CSVs, party affiliation
 │   ├── California/
 │   └── Massachusets/
-├── milestones_analysis/    # computed results (authoritative output root)
+├── milestones_analysis/    # LOCAL computed results (transient / legacy)
 │   ├── CA/
-│   │   ├── dataxuser/            # legacy per-user files (old format)
-│   │   ├── all_scalars_period_*/ # new columnar parquet shards
-│   │   ├── S_period_*/
-│   │   ├── weekly_rg_period_*/
-│   │   ├── gonzalez_period_*/
-│   │   └── frequency_period_*/
 │   └── MA/
-│       ├── radius_gyration_measures_new_threshold/ (legacy)
-│       ├── distance_measures_new_threshold/        (legacy)
-│       ├── k_radius_gyration_measures_new_threshold/
-│       ├── entropic_measures_new_threshold/
-│       ├── gonzalez_new_threshold/
-│       ├── st_new_threshold/
-│       ├── location_frequency_new_threshold/
-│       ├── home_new_threshold/
-│       └── plot/
 ├── .github/
 │   └── skills/             # documentation skills
+│       ├── new_project_structure/SKILL.md  ← this file
+│       ├── parallelization/SKILL.md        ← numba/polars patterns
+│       ├── data-handling/SKILL.md
+│       ├── old_structurefile_system/SKILL.md
+│       ├── structure_old_process/SKILL.md
+│       └── old_output_structure/SKILL.md
 ├── pyproject.toml          # uv-managed dependencies
 └── README.md
 ```
 
-> `output/CA/` (old placeholder directory) has been removed.
-> The canonical output root is always `milestones_analysis/`.
+> **Authoritative output location**: `chub-datalake/shared/cuebiq/MOBS/final_pipeline/`
+> on the S3-compatible store at `https://s3.atlas.fbk.eu`.
+> Local `milestones_analysis/` is a legacy / transitional cache only.
 
 ---
 
@@ -167,22 +164,128 @@ milestones_analysis/{REGION}/
 | `read_weekly_rg_matrix(period)` | return `[weeks × users]` matrix |
 | `migrate_from_legacy(kind, period, np_, t)` | migrate old per-user files → parquet store |
 | `migrate_all_periods(np_, t)` | migrate all periods for a region |
+| `upload_file_to_s3(local_path, bucket, key, endpoint_url)` | upload single file to S3 |
+| `upload_period_to_s3(period, bucket, prefix, endpoint_url)` | upload all kinds for a period |
+| `upload_all_to_s3(period_names, bucket, prefix, endpoint_url)` | upload all periods |
+| `list_s3_computed_periods(bucket, prefix, endpoint_url)` | check what is already on S3 |
+
+**Default upload behaviour** — controlled by `S3_UPLOAD_DEFAULT` env var (default `"1"` = upload).
+After consolidation, call `upload_all_to_s3()` to push data to `final_pipeline/`.
+
+### `vectorized_pipeline.py`
+
+Drop-in vectorized replacement for the per-user `User`-object loop.  Eliminates
+all skmob overhead and scales to 100k+ users without Python per-user objects.
+
+**Public API:**
+
+```python
+from src.vectorized_pipeline import preprocess_shard_polars, compute_all_polars
+# or simply:
+from src import preprocess_shard_polars, compute_all_polars
+```
+
+**`preprocess_shard_polars(file, dataset) -> dict[str, pl.DataFrame]`**
+- Replaces `dataset_info.__init__()` + `preprocess()`.
+- Uses `pl.scan_parquet()` with predicate-pushdown bbox filter (no Shapely per row).
+- Applies numba-backed temporal filter via `map_groups`.
+- Returns `{period_name: pl.DataFrame}` with columns
+  `[userId, lat, lon, begin, end, geohash7, dur_min]`.
+
+**`compute_all_polars(cfg, dataset, period_df, period, already_done_scalars,
+already_done_gonzalez, already_done_st, already_done_freq, already_done_wrg,
+store, batch_size=5000)`**
+- Replaces `compute_all()` (legacy `User`-loop path).
+- All scalar metrics computed in a **single** `group_by().agg()` pass.
+- County / rurality assigned via GeoPandas `sjoin` (vectorized O(n log k)).
+- S(t) and Gonzalez PCA via `map_groups` (no skmob).
+- Writes results to `ParquetStore` in chunks of `batch_size`.
+
+**Metrics implemented (vectorized, no skmob):**
+
+| Metric | Approach |
+|--------|----------|
+| `radius_of_gyration` | Polars 2-pass join (center-of-mass → projection → weighted RG) |
+| `random_entropy` | `log2(n_distinct)` via group_by agg |
+| `uncorrelated_entropy` | `-Σ p·log2(p)` via group_by agg |
+| `real_entropy` | LZ78 in pure Python via `map_groups` |
+| `distance` | Haversine via polars `shift().over()` expressions |
+| `home_location` | Most-visited geohash7 by `sum(dur_min)` |
+| `k_radius_of_gyration` | Top-k locations by visit count + RG on subset |
+| `q` (fraction time) | `sum(dur_min) / period_duration` via group_by |
+| `S(t)` | `map_groups` + compiled per-user time-step loop |
+| `Gonzalez PCA` | NumPy PCA on projected coordinates via `map_groups` |
+| `frequency/rank` | Polars group_by count + sort |
+| County assignment | GeoPandas `sjoin` (replaces Shapely per-row loop) |
+
+**Bugs fixed vs `User.py`:**
+- `radius_of_gyration`: old code used `xy()` on the full DataFrame inside a
+  per-geohash loop (so `x[0]` always referred to the first row of the *full* frame).
+- `Gonzalez`: old code had lat/lon variable labels swapped for the reference point
+  (`mean_lon = np.array(self.df.lat).mean()`).
+
+---
+
+### `tile_counties_via_geohash.py`
+
+Tiles a county shapefile / GeoDataFrame with a geohash grid.
+
+```python
+from src.tile_counties_via_geohash import tile_counties_via_geohash, coarsen_geohash_series
+
+grid = tile_counties_via_geohash(county_gdf, precision=5)
+# → GeoDataFrame with columns: geohash, geometry (Polygon, EPSG:4326), area_km2
+```
+
+Geohash is hierarchical — coarsen trajectory geohashes with:
+
+```python
+df["geohash5"] = coarsen_geohash_series(df["geohash7"], precision=5)
+# or in Polars: pl.col("geohash7").str.slice(0, 5)
+```
+
+Recommended precision for 32 GB RAM: **5** (CA: ~17 000 cells, MA: ~4 500 cells).
+
+### `transition_matrices/transition_pipeline.py` — `TransitionPipeline`
+
+End-to-end pipeline from raw trajectories to transition / presence matrices.
+Results go directly to S3 (`final_pipeline/{region}/transition_matrices/`).
+
+```python
+from src.transition_matrices import TransitionPipeline
+pipeline = TransitionPipeline(dataset, geohash_precision=5, delta_time_h=1)
+pipeline.run_all_periods()
+```
+
+Output tables:
+
+* **presence_matrix** — `(geohash, time_int, datetime, count_birth, count_death, count_transit, count, probability)`
+* **transition_matrix** — `(geohash_start, geohash_end, time_int, datetime, transitions, transition_probability)`
+
+Cache index (`cache_index.json`) lives on S3 alongside the output files.
+Resume is O(1) — the cache is downloaded once per run.
 
 ### `pipeline.py`
 
 **`get_config(region, config_dir)`** — loads `data/config/config_{region}.json`.
 
-**`compute_all(cfg, dataset, list_users, period, df, output_dir, store, batch_size)`**:
-1. Filters users with `< np_` stop-points.
-2. Skips users already in the store (parquet footer check).
-3. Creates a `User` per user, calls requested metric methods.
-4. Accumulates in-memory batch dicts.
-5. Flushes to `store` every `batch_size` (default 500) users.
+**`compute_all(cfg, dataset, list_users, period, df, output_dir, store, batch_size, n_workers=1, use_vectorized=False)`**:
+- When `use_vectorized=True`: converts `df` pandas → polars and delegates
+  immediately to `compute_all_polars()` (no `User` objects created).
+- Otherwise (legacy path):
+  1. Filters users with `< np_` stop-points.
+  2. Skips users already in the store (parquet footer check).
+  3. Pre-groups DataFrame into `{uid: sub_df}` dict to avoid repeated pandas groupby.
+  4. Creates a `User` per user (serial when `n_workers=1`, ProcessPoolExecutor otherwise).
+  5. Flushes to `store` every `batch_size` (default 500) users.
 
-**`analyze_from_dataset(dataset, name, store)`** — processes local raw parquets.
+**`analyze_from_dataset(dataset, name, store, n_workers=1, use_vectorized=False)`**
+— processes local raw parquets.
 
-**`analyze_from_s3_progressive(dataset, name, store, s3_client)`**:
+**`analyze_from_s3_progressive(dataset, name, store, ..., n_workers=1, use_vectorized=False)`**:
 - Downloads one shard at a time from S3.
+- When `use_vectorized=True`: calls `preprocess_shard_polars()` + `compute_all_polars()`
+  directly — pandas and skmob are never touched for that shard.
 - Checkpoint file `shard_checkpoint_{region}.json` tracks completed shards.
 - Deletes local shard copy after processing.
 - Fully resume-safe.
@@ -239,9 +342,21 @@ match the old pipeline's capabilities plus enhancements:
 
 | Situation | Action |
 |-----------|--------|
-| Raw Cuebiq parquet files accessible | `analyze_from_dataset()` or `analyze_from_s3_progressive()` |
+| Raw Cuebiq parquet files accessible (fast, recommended) | `analyze_from_s3_progressive(..., use_vectorized=True)` |
+| Raw Cuebiq parquet files accessible (legacy skmob path) | `analyze_from_dataset()` or `analyze_from_s3_progressive()` |
 | Only legacy per-user CSV.gz files exist | `store.migrate_all_periods()` one-time migration |
 | Parquet store already populated | skip to visualisation |
+
+**Recommended call for production:**
+
+```python
+analyze_from_s3_progressive(
+    dataset, "CA", cfg, store,
+    endpoint_url=ENDPOINT, bucket=BUCKET, s3_prefix=S3_PREFIX,
+    batch_size=10_000,
+    use_vectorized=True,   # polars+numba; skips skmob entirely
+)
+```
 
 ---
 
@@ -271,12 +386,49 @@ the MA per-metric subdirectory layouts.
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
-| `MILESTONES_DIR` | `<project>/milestones_analysis` | Override output root |
+| `MILESTONES_DIR` | `<project>/milestones_analysis` | Override local output root (legacy / transitional) |
 | `SHARD_TEMP_DIR` | `<project>/.shard_tmp` | Temp dir for S3 downloads |
 | `S3_ENDPOINT_URL` | `https://s3.atlas.fbk.eu` | S3-compatible endpoint |
-| `S3_BUCKET` | `chub-datalake` | S3 bucket name |
+| `S3_BUCKET` | `chub-datalake` | S3 bucket for raw input data |
 | `S3_PREFIX_CA` | `shared/cuebiq/MOBS/urban_rural_flow_stops_cali_urban_rural_v3` | CA raw shard prefix |
 | `S3_PREFIX_MA` | `shared/cuebiq/MOBS/20220330_stops_hq_users_MA` | MA raw shard prefix |
+| `S3_OUTPUT_BUCKET` | `chub-datalake` | Bucket for final_pipeline output |
+| `S3_OUTPUT_PREFIX_CA` | `shared/cuebiq/MOBS/final_pipeline/CA` | CA output prefix |
+| `S3_OUTPUT_PREFIX_MA` | `shared/cuebiq/MOBS/final_pipeline/MA` | MA output prefix |
+| `S3_UPLOAD_DEFAULT` | `1` | Set to `0` to keep data local only |
+
+---
+
+## S3 output layout (final_pipeline)
+
+All computed results from the **new** pipeline live under:
+
+```
+chub-datalake/
+  shared/cuebiq/MOBS/
+    final_pipeline/               ← clean, versioned output root
+      CA/
+        all_scalars_period_*/consolidated.parquet
+        S_period_*/consolidated.parquet
+        weekly_rg_period_*/consolidated.parquet
+        gonzalez_period_*/consolidated.parquet
+        frequency_period_*/consolidated.parquet
+        transition_matrices/
+          presence_prec5_dh1.0_15_jan_-_15_march.parquet
+          transition_prec5_dh1.0_15_jan_-_15_march.parquet
+          cache_index.json          ← resume index
+      MA/
+        …same structure…
+```
+
+Raw input data stays in:
+
+```
+    urban_rural_flow_stops_cali_urban_rural_v3/  ← CA raw shards (read-only)
+    20220330_stops_hq_users_MA/                  ← MA raw shards (read-only)
+```
+
+**Never write into the raw-data prefixes.**
 
 ---
 
@@ -303,3 +455,8 @@ source .venv/bin/activate
    files to the new store; after migration the legacy files can be archived.
 5. **MA scales np_** — MA analysis is run for multiple `np_` values
    (sensitivity analysis); CA uses only `np_=20`.
+6. **Vectorized path is the preferred production path** — `use_vectorized=True`
+   eliminates all per-user Python object overhead and skmob calls.  The legacy
+   `User`-based path is kept for reproducibility and regression testing only.
+7. **Bug fixes in vectorized path** — RG and Gonzalez metrics have corrected
+   implementations; results will differ slightly from the legacy path.

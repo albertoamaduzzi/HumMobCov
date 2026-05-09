@@ -29,10 +29,12 @@ orchestrator to use the new columnar parquet backend.
 """
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -48,6 +50,98 @@ from .constants import DIR_OUTPUT, DIR_CONFIG, DIR_MILESTONES_SERVER, DIR_SHARD_
 
 if TYPE_CHECKING:
     from .store import ParquetStore
+
+
+# ---------------------------------------------------------------------------
+# Worker-pool infrastructure (process-level parallelism)
+# ---------------------------------------------------------------------------
+
+_g_worker_state: dict = {}  # populated by _init_worker in each worker process
+
+
+def _init_worker(cfg: dict, shared_data: dict) -> None:
+    """Called once per worker process to load shared read-only state."""
+    global _g_worker_state
+    _g_worker_state = {"cfg": cfg, **shared_data}
+
+
+def _run_user_worker(uid_str: str, user_df) -> dict:
+    """
+    Compute all enabled metrics for one user.  Runs inside a worker process
+    and returns a result dict to the main process for batch writing.
+    """
+    state         = _g_worker_state
+    cfg           = state["cfg"]
+    period        = state["period"]
+    region        = state["region"]
+    np_           = state["np_"]
+    t_threshold   = state["t_threshold"]
+    p2div         = state["period_names2period_division"]
+    period_div    = state["period_division"]
+    perodname2idx = state["perodname2idx"]
+    geojson       = state.get("geojson")
+    county2party  = state.get("county2party", {})
+    county2rural  = state.get("county2rural", {})
+    raw           = cfg.get("raw_trajectories", False)
+
+    ciccio = User(user_df, period, region, np_, t_threshold, p2div)
+    ciccio.time_filtering_traj_per_person(t_threshold)
+
+    result: dict = {
+        "uid":      uid_str,
+        "n_points": len(ciccio.df),
+        "scalars":  None,
+        "gonzalez": None,
+        "st":       None,
+        "freq":     None,
+        "wrg":      None,
+        "weeks":    None,
+    }
+
+    if cfg.get("is_weekly_radius_gyration"):
+        weeks = ciccio.divide_weeks(period_div, period, perodname2idx)
+        _dummy_w2p = {str(w): 0 for w in weeks}
+        ciccio.compute_weekly_radius_gyration(period, _dummy_w2p, period_div, perodname2idx)
+        result["wrg"]   = dict(ciccio.week2rg)
+        result["weeks"] = [str(w) for w in weeks]
+
+    def _run_if(flag: str, already_flag: str, method_name: str) -> None:
+        if cfg.get(flag) and not cfg.get(already_flag) and raw:
+            getattr(ciccio, method_name)()
+
+    _run_if("is_radius_gyration",       "already_computed_rg",                  "compute_radius_of_gyration")
+    _run_if("is_random_entropy",        "already_computed_random_entropy",       "compute_random_entropy")
+    _run_if("is_uncorrelated_entropy",  "already_computed_uncorrelated_entropy", "compute_uncorrelated_entropy")
+    _run_if("is_real_entropy",          "already_computed_real_entropy",         "compute_real_entropy")
+    _run_if("is_distance",              "already_computed_distance",             "compute_straight_line_distance")
+    _run_if("is_home",                  "already_computed_home",                 "compute_home")
+    _run_if("is_krg",                   "already_computed_krg",                  "compute_krg")
+    _run_if("is_fraction_time",         "already_computed_fraction_time",        "compute_fraction_time_user_is_present")
+
+    if cfg.get("is_county_rural") and not cfg.get("already_computed_county_rural"):
+        ciccio._get_county(geojson, county2party, county2rural)
+
+    if cfg.get("is_gonzalez") and not cfg.get("already_computed_gonzalez") and raw:
+        ciccio.compute_gonzalez()
+        if hasattr(ciccio, "df2save_gonzalez") and ciccio.df2save_gonzalez is not None:
+            import pandas as _pd
+            gdf = ciccio.df2save_gonzalez
+            if isinstance(gdf, dict):
+                gdf = _pd.DataFrame(gdf)
+            result["gonzalez"] = gdf
+
+    if cfg.get("is_St") and not cfg.get("already_computed_St") and raw:
+        ciccio.compute_St()
+        if hasattr(ciccio, "df_St"):
+            result["st"] = ciccio.df_St["visited_places"].tolist()
+
+    if cfg.get("is_frequency") and not cfg.get("already_computed_frequency") and raw:
+        ciccio.compute_frequency_location()
+        if hasattr(ciccio, "df2frequencyrank"):
+            result["freq"] = ciccio.df2frequencyrank
+
+    result["scalars"] = dict(ciccio.df2save)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +189,8 @@ def compute_all(
     output_dir: Path | str | None = None,
     store: "ParquetStore | None" = None,
     batch_size: int = 500,
+    n_workers: int = 1,
+    use_vectorized: bool = False,
 ) -> dict:
     """
     Compute all requested metrics for every user in ``list_users``.
@@ -120,12 +216,70 @@ def compute_all(
     batch_size : int
         Number of users to accumulate before flushing to the store.
         Ignored when ``store`` is None.
+    n_workers : int
+        Number of parallel worker processes for metric computation.
+        ``1`` (default) runs serially.  Values ``> 1`` use
+        ``ProcessPoolExecutor``; set to ``os.cpu_count()`` or a fraction
+        thereof to saturate all available cores.  Only active in
+        ``raw_trajectories`` mode.  Ignored when ``use_vectorized=True``.
+    use_vectorized : bool
+        When ``True``, bypass the per-user loop entirely and delegate to
+        :func:`~src.vectorized_pipeline.compute_all_polars`.  Requires
+        ``df`` to be a ``dataset_info`` object (raw trajectories mode).
+        The polars-based path replaces all skmob calls with direct polars/
+        numpy/numba implementations and can be 20–100× faster on wide
+        DataFrames.  Default ``False`` keeps existing behaviour.
 
     Returns
     -------
     dict
         ``{week_datetime: [point_counts]}``
     """
+    # ── fast vectorized path ────────────────────────────────────────────
+    if use_vectorized and df is not None and cfg.get("raw_trajectories"):
+        from .vectorized_pipeline import compute_all_polars as _vec_all
+        import polars as _pl
+
+        # Convert pandas period DataFrame to polars
+        pandas_df = df.period2df.get(period)
+        if pandas_df is None or len(pandas_df) == 0:
+            return {}
+        polars_df = _pl.from_pandas(pandas_df.reset_index(drop=True))
+
+        # Add dur_min if missing
+        if "dur_min" not in polars_df.columns:
+            polars_df = polars_df.with_columns(
+                (_pl.col("end") - _pl.col("begin"))
+                .dt.total_minutes()
+                .cast(_pl.Float64)
+                .alias("dur_min")
+            )
+        # Rename skmob columns if needed
+        rename_map = {}
+        if "lat" not in polars_df.columns and "clusterLatitude" in polars_df.columns:
+            rename_map["clusterLatitude"] = "lat"
+        if "lon" not in polars_df.columns and "clusterLongitude" in polars_df.columns:
+            rename_map["clusterLongitude"] = "lon"
+        if rename_map:
+            polars_df = polars_df.rename(rename_map)
+
+        # Resume sets
+        if store is not None:
+            ad_scalars  = store.get_computed_users(period, "all_scalars")
+            ad_gonzalez = store.get_computed_users_long(period, "gonzalez")
+            ad_st       = store.get_computed_users(period, "S")
+            ad_freq     = store.get_computed_users_long(period, "frequency")
+            ad_wrg      = store.get_computed_users(period, "weekly_rg")
+        else:
+            ad_scalars = ad_gonzalez = ad_st = ad_freq = ad_wrg = set()
+
+        return _vec_all(
+            cfg, dataset, polars_df, period,
+            ad_scalars, ad_gonzalez, ad_st, ad_freq, ad_wrg,
+            store, batch_size,
+        )
+
+    # ── existing per-user path (unchanged) ──────────────────────────────
     overall_count = 0
     dictweek2npeople = None
     week2points: dict = defaultdict(list)
@@ -183,7 +337,83 @@ def compute_all(
 
     raw = cfg.get("raw_trajectories", False)
 
-    for user in list_users:
+    # ── pre-group period DataFrame once ────────────────────────────────────
+    # Calling groupby inside the user loop would be O(N*M) total (N users,
+    # M rows).  Building the dict here is O(M) and every subsequent lookup
+    # is O(1), typically giving 10–100x speedup on large shards.
+    user_groups: dict | None = None
+    if df is not None and raw:
+        user_groups = {uid: grp for uid, grp in df.period2df[period].groupby("userId")}
+
+    # ── parallel path ──────────────────────────────────────────────────────
+    # Each user's metric computation is independent; spawn n_workers worker
+    # processes to saturate available CPUs.  Batch writes are done serially
+    # in the main process to avoid file-level contention.
+    if n_workers > 1 and raw and user_groups is not None:
+        pending = [
+            u for u in list_users
+            if str(u) not in already_done_scalars and u in user_groups
+        ]
+        shared_data = {
+            "period":                       period,
+            "region":                       dataset.id_,
+            "np_":                          dataset.np_,
+            "t_threshold":                  dataset.t_threshold,
+            "period_names2period_division": dataset.period_names2period_division,
+            "period_division":              df.period_division,
+            "perodname2idx":                df.perodname2idx,
+            "geojson":                      getattr(dataset, "geojson",      None),
+            "county2party":                 getattr(dataset, "county2party", {}),
+            "county2rural":                 getattr(dataset, "county2rural", {}),
+        }
+        with ProcessPoolExecutor(
+            max_workers=n_workers,
+            initializer=_init_worker,
+            initargs=(cfg, shared_data),
+        ) as pool:
+            futures = {
+                pool.submit(_run_user_worker, str(u), user_groups[u]): u
+                for u in pending
+            }
+            for future in as_completed(futures):
+                try:
+                    res = future.result()
+                except Exception as exc:
+                    print(f"[WARN] User {futures[future]} raised: {exc}")
+                    continue
+
+                uid_str = res["uid"]
+                dataset.period2totalpoints[period] += res["n_points"]
+
+                if res["scalars"] is not None:
+                    scalar_batch[uid_str] = res["scalars"]
+                if res["gonzalez"] is not None and uid_str not in already_done_gonzalez:
+                    gonzalez_batch[uid_str] = res["gonzalez"]
+                if res["st"] is not None and uid_str not in already_done_st:
+                    st_batch[uid_str] = res["st"]
+                if res["freq"] is not None and uid_str not in already_done_freq:
+                    freq_batch[uid_str] = res["freq"]
+                if res["wrg"] is not None and uid_str not in already_done_wrg:
+                    wrg_batch[uid_str] = res["wrg"]
+                    if not all_weeks_for_wrg and res["weeks"]:
+                        all_weeks_for_wrg.extend(res["weeks"])
+                    if dictweek2npeople is None and res["weeks"]:
+                        dictweek2npeople = {w: 0 for w in res["weeks"]}
+                    if len(wrg_batch) >= batch_size:
+                        store.write_weekly_rg_batch(period, wrg_batch, all_weeks_for_wrg)
+                        wrg_batch.clear()
+
+                _flush_batches()
+                overall_count += 1
+                if overall_count % 10_000 == 0:
+                    print(f"Processed {overall_count} users in period '{period}'")
+
+    # ── serial path (skipped when parallel workers are active) ─────────────
+    _serial_users = (
+        [] if (n_workers > 1 and raw and user_groups is not None) else list_users
+    )
+
+    for user in _serial_users:
         uid_str = str(user)
 
         # ── skip already-computed (resume logic) ──────────────────────────
@@ -194,7 +424,8 @@ def compute_all(
         # Instantiate User
         # ----------------------------------------------------------------
         if raw:
-            user_df = df.period2df[period].groupby("userId").get_group(user)
+            user_df = user_groups[user] if (user_groups is not None and user in user_groups) else \
+                      df.period2df[period].groupby("userId").get_group(user)
             ciccio  = User(
                 user_df, period, dataset.id_,
                 dataset.np_, dataset.t_threshold,
@@ -339,6 +570,8 @@ def analyze_from_dataset(
     output_dir: Path | str | None = None,
     store: "ParquetStore | None" = None,
     batch_size: int = 500,
+    n_workers: int = 1,
+    use_vectorized: bool = False,
 ) -> None:
     """
     Run the full analysis pipeline for ``dataset``.
@@ -359,6 +592,13 @@ def analyze_from_dataset(
         per-file path.
     batch_size : int
         Users per shard write in parquet-store mode.
+    n_workers : int
+        Number of parallel worker processes.  ``1`` (default) = serial.
+        Use ``os.cpu_count()`` or a fraction thereof to saturate CPUs.
+        Ignored when ``use_vectorized=True``.
+    use_vectorized : bool
+        When ``True``, use the polars/numba vectorized path instead of
+        the per-user loop.  Much faster on large shards.  Default ``False``.
     """
     cfg = get_config(region, config_dir)
     base_out = (
@@ -391,6 +631,8 @@ def analyze_from_dataset(
                     output_dir=base_out,
                     store=store,
                     batch_size=batch_size,
+                    n_workers=n_workers,
+                    use_vectorized=use_vectorized,
                 )
                 print(
                     f"  Total users: {dataset.period2totalusers[period]:,}  "
@@ -419,6 +661,8 @@ def analyze_from_dataset(
                 output_dir=base_out,
                 store=store,
                 batch_size=batch_size,
+                n_workers=n_workers,
+                use_vectorized=use_vectorized,
             )
             print(
                 f"  Period '{period}' — users: {dataset.period2totalusers[period]:,}  "
@@ -442,6 +686,8 @@ def analyze_from_s3_progressive(
     temp_dir: Path | None = None,
     batch_size: int = 500,
     consolidate_every: int = 1,
+    n_workers: int = 1,
+    use_vectorized: bool = False,
 ) -> None:
     """
     Download raw Cuebiq parquet shards from S3 one at a time, compute all
@@ -484,15 +730,27 @@ def analyze_from_s3_progressive(
         Consolidate the parquet store after every *N* processed shards
         (default 1 = after every shard).  Larger values reduce I/O at the
         cost of larger individual shard files.
+    n_workers : int
+        Number of parallel worker processes for per-user metric computation.
+        ``1`` (default) = serial.  Use ``os.cpu_count()`` or a capped value
+        (e.g. 32) to saturate available CPUs.
+    use_vectorized : bool
+        When ``True``, delegate each shard's computation to the polars/numba
+        vectorized path (``compute_all_polars``).  Recommended for large shards.
+        Default ``False``.
     """
     _temp_dir = Path(temp_dir) if temp_dir else DIR_SHARD_TEMP
     _temp_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. List available shards on S3 ─────────────────────────────────────
     s3_uri = f"s3://{bucket}/{s3_prefix}"
-    print(f"Listing shards at {s3_uri} …")
+    print(f"Listing shards at {s3_uri} (recursive) …")
     result = subprocess.run(
-        ["aws", "s3", "ls", s3_uri + "/", "--endpoint-url", endpoint_url],
+        [
+            "aws", "s3", "ls", s3_uri + "/",
+            "--endpoint-url", endpoint_url,
+            "--recursive",
+        ],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -500,14 +758,40 @@ def analyze_from_s3_progressive(
             f"aws s3 ls failed:\n  stdout: {result.stdout}\n  stderr: {result.stderr}"
         )
 
-    shard_names: list[str] = [
+    # With --recursive the last column is the full S3 key relative to the bucket
+    # root (e.g. "shared/cuebiq/MOBS/.../part-00000.parquet").  We use the full
+    # key as the stable checkpoint identifier and derive the local filename from
+    # the basename so that a flat temp-directory is always used.
+    # Entries whose last column is a directory prefix ("PRE …") never end in
+    # ".parquet" and are naturally excluded.
+    shard_full_keys: list[str] = [
         line.split()[-1]
         for line in result.stdout.strip().splitlines()
         if line.strip() and line.split()[-1].endswith(".parquet")
     ]
-    if not shard_names:
+    if not shard_full_keys:
         print(f"No .parquet shards found at {s3_uri}. Nothing to do.")
+        # Print the raw listing to aid debugging
+        if result.stdout.strip():
+            preview = "\n  ".join(result.stdout.strip().splitlines()[:10])
+            print(f"  Raw listing (first 10 lines):\n  {preview}")
         return
+
+    # Deduplicate basenames: if two keys share the same basename, append a
+    # short hash to avoid local collisions.
+    _seen_names: dict[str, int] = {}
+    shard_local_names: list[str] = []
+    for key in shard_full_keys:
+        base = Path(key).name
+        if base in _seen_names:
+            _seen_names[base] += 1
+            stem, _, ext = base.rpartition(".")
+            base = f"{stem}_{_seen_names[base]}.{ext}"
+        else:
+            _seen_names[base] = 0
+        shard_local_names.append(base)
+
+    # checkpoint keys are the full S3 keys (stable across re-runs)
 
     # ── 2. Load shard-level checkpoint ──────────────────────────────────────
     checkpoint_path = (
@@ -521,23 +805,30 @@ def analyze_from_s3_progressive(
     else:
         completed_shards = set()
 
-    pending = [s for s in shard_names if s not in completed_shards]
+    pending_keys:   list[str] = [k for k in shard_full_keys if k not in completed_shards]
+    pending_locals: list[str] = [
+        local
+        for k, local in zip(shard_full_keys, shard_local_names)
+        if k not in completed_shards
+    ]
     print(
-        f"Shards — total: {len(shard_names)}  "
+        f"Shards — total: {len(shard_full_keys)}  "
         f"completed: {len(completed_shards)}  "
-        f"pending: {len(pending)}"
+        f"pending: {len(pending_keys)}"
     )
 
-    if not pending:
+    if not pending_keys:
         print("All shards already processed. Nothing to do.")
         return
 
     # ── 3. Process shards one by one ────────────────────────────────────────
-    for shard_idx, shard_name in enumerate(pending):
-        local_path = _temp_dir / shard_name
-        s3_key     = f"s3://{bucket}/{s3_prefix}/{shard_name}"
+    for shard_idx, (shard_key, local_name) in enumerate(
+        zip(pending_keys, pending_locals)
+    ):
+        local_path = _temp_dir / local_name
+        s3_key     = f"s3://{bucket}/{shard_key}"
 
-        print(f"\n[{shard_idx + 1}/{len(pending)}] Processing {shard_name} …")
+        print(f"\n[{shard_idx + 1}/{len(pending_keys)}] Processing {shard_key} …")
 
         # 3a. Download
         print(f"  Downloading from {s3_key} …")
@@ -552,6 +843,56 @@ def analyze_from_s3_progressive(
 
         # 3b. Preprocess
         try:
+            if use_vectorized:
+                # ── Fast path: polars preprocessing (no pandas, no skmob) ──
+                from .vectorized_pipeline import (
+                    preprocess_shard_polars as _prep_polars,
+                    compute_all_polars as _vec_all,
+                )
+                period2pldf = _prep_polars(local_path, dataset)
+                print(f"  [vectorized] Preprocessed {len(period2pldf)} periods.")
+
+                for period in dataset.period_names:
+                    pldf = period2pldf.get(period)
+                    if pldf is None or pldf.is_empty():
+                        continue
+                    n_users = pldf["userId"].n_unique()
+                    dataset.period2totalusers[period] += n_users
+                    dataset.period2totalpoints[period] += len(pldf)
+                    print(f"  Period '{period}': {n_users:,} users …")
+
+                    ad_scalars  = store.get_computed_users(period, "all_scalars")
+                    ad_gonzalez = store.get_computed_users_long(period, "gonzalez")
+                    ad_st       = store.get_computed_users(period, "S")
+                    ad_freq     = store.get_computed_users_long(period, "frequency")
+                    ad_wrg      = store.get_computed_users(period, "weekly_rg")
+
+                    _vec_all(
+                        cfg, dataset, pldf, period,
+                        ad_scalars, ad_gonzalez, ad_st, ad_freq, ad_wrg,
+                        store, batch_size,
+                    )
+
+                local_path.unlink(missing_ok=True)
+                print(f"  Local copy deleted.")
+                completed_shards.add(shard_key)
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(checkpoint_path, "w") as _f:
+                    json.dump({"completed": sorted(completed_shards)}, _f, indent=2)
+                if (shard_idx + 1) % consolidate_every == 0:
+                    print(f"  Consolidating store …")
+                    for period in dataset.period_names:
+                        store.consolidate_all(period)
+                print(
+                    f"  Cumulative users: "
+                    + "  ".join(
+                        f"{p!r}: {dataset.period2totalusers[p]:,}"
+                        for p in dataset.period_names
+                    )
+                )
+                continue  # → next shard (skip the legacy block below)
+
+            # ── Legacy path: pandas / skmob preprocessing ──────────────────
             df_info = dataset_info(
                 local_path,
                 dataset.period_division,
@@ -583,6 +924,8 @@ def analyze_from_s3_progressive(
                     df_info,
                     store=store,
                     batch_size=batch_size,
+                    n_workers=n_workers,
+                    use_vectorized=use_vectorized,
                 )
         except Exception as exc:
             print(f"  WARNING: compute error — skipping shard.\n  {exc}")
@@ -594,7 +937,7 @@ def analyze_from_s3_progressive(
         print(f"  Local copy deleted.")
 
         # 3e. Update shard checkpoint
-        completed_shards.add(shard_name)
+        completed_shards.add(shard_key)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         with open(checkpoint_path, "w") as _f:
             json.dump({"completed": sorted(completed_shards)}, _f, indent=2)

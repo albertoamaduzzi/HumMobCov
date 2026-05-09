@@ -1,0 +1,138 @@
+\documentclass[main.tex]{subfiles}
+
+\begin{document}
+\label{results}
+
+In this section, we show the results of our study in the case of California. An equivalent analysis has been conducted for the Massachusetts metropolitan area and is presented in the appendix \ref{appendix:stability_analysis}, which shows qualitatively the same results. {\color{red} Is there any difference in the results? Please discuss.}First, we have a look at the radius of gyration distance distribution Fig.\ref{radg_and_dist_california}. They show that during lockdown measures, the majority of trips are concentrated near the centre of mass of the trajectory (less than 2 km) compared to before and after, having, in both cases, even shorter trips as the most representative (less than 1 km), as can be seen in the geodesic distance distribution. {\color{red} This is an important point and one of the original questions of the work: during lockdown, is there a consistent decrease across the entire distribution (a simple rescaling), or is there a "change in shape" of the distribution? The distributions in Fig 1, normalised to the number of locations visited in order to overlap across the three time periods, indicate that the probability density function of the gyration radius has a different distribution during the lockdown.}
+
+In addition, this information with returner explorer distributions Fig.\ref{returner_explorers_california} suggests that people are measurably more inclined to choose short trips with higher relative frequency, becoming more returners than explorers. This fact is confirmed also by the discovery pattern in Fig.\ref{visitation increase-frequency_california} and the frequency visitation plot where you can see that relative to the lockdown periods, the other periods are characterized by higher "discover rate" and more routinary trips in the higher ranked visited places.
+
+These trips are distributed in 2-dimensional space in an invariant shape Fig.\ref{Gonzalez_california} but have the peaks of presence closer to one another during the lockdown. {\color{red}What does it mean? How much closer? Please discuss} The fact that trajectories seem more simple is also visible from entropic considerations Fig.\ref{entropic_measures_california}. In all the different measures considered, it is the case that during lockdown, we note a smaller amount of information can be derived on average from trajectories.  The reason for this behavior can have roots in the fact that the succession of places is more periodic during the lockdown or that the total number of visited places is, on average, smaller.
+
+On average, the latter hypothesis seems the most plausible since we interpret the fact that the distribution obtained rescaling on the number of visited places is shifted to the right as the fact that the information compressed by the Lempel-Ziv algorithm on the succession of points in the trajectory, on average is lower. 
+In the end, we divide the population in terms of the rurality level (defined as zones whose density is bigger than 500 people per $km^2$) and the governing party of the residence county.
+
+We see that if, on the one hand, rurality level seems not to be important for the weekly radius of gyration, the party governing is, having that people in republican governed counties tend to move more during lockdown Fig. \ref{weekly_county_rural}. These results give a snapshot of the mobility changes that occurred by the activation of Non-Pharmaceutical Measures in California and highlight the differences in the shape, complexity and size of mobility of people.
+%
+{
+\renewcommand{\arraystretch}{1.5} % up/down padding
+\setlength{\tabcolsep}{12pt}      % left/right padding
+\begin{table}[H]
+    \centering
+    \begin{tabular}{l r r r}
+        \rowcolor{gray!5}
+        California & $N_c$ & $T_c$ & $\langle T_c \rangle_p$ \\
+        \rowcolor{figblue!20}
+        15 January -- 15 March & 1,009,464 & 164,994,721 & 163 \\
+        \rowcolor{figorange!20}
+        15 March -- 15 May     &   490,673 &  12,701,431 & 26 \\
+        \rowcolor{figgreen!20}
+        15 May -- September    &   460,654 &  32,096,311 & 70 \\
+    \end{tabular}
+    \caption{Main information about the California preprocessed dataset with columns $N_c$ number of users, number of total points $T_c$ and average points per each trajectory $\langle T_c \rangle_p$}
+    \label{tabPeopleCal}
+\end{table}
+}
+%
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.45\textwidth]{figures/main/rg_20_hour_1_CA.png} \includegraphics[width=0.45\textwidth]{figures/main/distance_20_hour_1_CA.png} 
+    \caption{On the left: Distribution of radius of gyration among three different periods. The lockdown curve is above the other two curves for distances below 3 km and below up to 1000 km, meaning that medium-distance mobility is redistributed to the short-distance one, while preserving long-trip mobility. On the right: Distribution of distances among successive stop points in three different periods and their corresponding power laws. Prevalence of short distance travels and long tail can be observed. Time threshold = 1 h }
+    \label{radg_and_dist_california}
+\end{figure}
+%
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.3\textwidth]{figures/main/rg_krg_15 jan - 15 march_20_hour_1_k_3_CA.png} 
+    \includegraphics[width=0.3\textwidth]{figures/main/rg_krg_15 march - 15 may_20_hour_1_k_3_CA.png} 
+    \includegraphics[width=0.3\textwidth]{figures/main/rg_krg_15 may - sept_20_hour_1_k_3_CA.png}
+    \includegraphics[width=0.3\textwidth]{figures/main/rg_krg_15 jan - 15 march_20_hour_1_k_10.png} 
+    \includegraphics[width=0.3\textwidth]{figures/main/rg_krg_15 march - 15 may_20_hour_1_k_10.png} 
+    \includegraphics[width=0.3\textwidth]{figures/main/rg_krg_15 may - sept_20_hour_1_k_10.png}  
+    \caption{Distribution of (radius of gyration, k-radius of gyration) in three different periods. From top to bottom k = 3, 6 {\color{red} missing}, 10. From left to right period of measure (15 January - 15 March, 15 March - 15 May, 15 May - September). Time threshold = 1 hours}
+    \label{returner_explorers_california}
+\end{figure}
+%
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.3\textwidth]{figures/main/gonzalez_15 jan - 15 march_20_hour_1_CA.png}
+    \includegraphics[width=0.3\textwidth]{figures/main/gonzalez_15 march - 15 may_20_hour_1_CA.png}
+    \includegraphics[width=0.3\textwidth]{figures/main/gonzalez_15 may - sept_20_hour_1_CA.png}
+    \includegraphics[width=0.3\textwidth]{figures/main/conditional_gonzalez_15 jan - 15 march_20_hour_1_CA.png}
+    \includegraphics[width=0.3\textwidth]{figures/main/conditional_gonzalez_15 march - 15 may_20_hour_1_CA.png}
+    \includegraphics[width=0.3\textwidth]{figures/main/conditional_gonzalez_15 may - sept_20_hour_1_CA (1).png}
+    \caption{Distribution of positions of people stops' points in their intrinsic reference frames re-scaled by the variance of the rotated coordinates in the x,y-rotated axes. From left to right, different periods (15 January - 15 March, 15 March - 15 May, 15 May - September). The bottom figures are the conditional probability fixing the coordinate y = 0. Case of time threshold of 1 hour}
+    \label{Gonzalez_california}
+\end{figure}
+%
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.3\textwidth]{figures/main/sigmaxy_15 jan - 15 march_20_hour_1_CA.png}
+    \includegraphics[width=0.3\textwidth]{figures/main/sigmaxy_15 march - 15 may_20_hour_1_CA.png}
+    \includegraphics[width=0.3\textwidth]{figures/main/sigmaxy_15 may - sept_20_hour_1_CA.png}
+    \caption{Distribution of variances of trajectories stops' points in their intrinsic reference frames re-scaled by the variance of the rotated coordinates in the x,y-rotated axes. From left to right, different periods (15 January - 15 March, 15 March - 15 May, 15 May - September). Time threshold of 1 hour.}
+    \label{sigma}
+\end{figure}
+%
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.45\textwidth]{figures/main/St_different_periods_fit_20_hour_1_CA.png}
+    \includegraphics[width=0.45\textwidth]{figures/main/rank_plot_20_hour_1_CA.png} 
+    \caption{On the left: Average number of stop points visited in time. During lockdown, the rate of discovery is lower than the other two periods. On the right: Distribution of frequency of visits of first ten preferred places for each user. During lockdown, the first two ranked visited places occupy 70 \%of the visitation pattern, against 50\% and 40\% of the before and after periods. Case of time threshold of 1 hour}
+    \label{visitation_increase-frequency_california}
+\end{figure}
+%
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.45\textwidth]{figures/main/avg_rg_all_week_parties_20_hour_1_CA.png}
+    \includegraphics[width=0.45\textwidth]{figures/main/avg_rg_all_week_rurals_20_hour_1_CA.png} 
+    \caption{On the left: Average radius of gyration per week for people characterized by the party governing their home county. On the right: Average radius of gyration per week for people characterized by the level of rurality in their home. The different period, (pre,during,post)-lockdown, are separated by vertical lines. The party governing is not very significant in the prediction of the radius of gyration. On the other hand, the  rurality level shows that people living in rural areas have higher mobility both during and after loockdown with respect to people living in urban areas. Case of time threshold of 1 hour {\color{red} It is unclear how this analysis ties into the rest of the paper: why was it conducted? What are the expected results (according to previous literature)? What have we discovered that is new (if any)? Can the differences between rural and urban results be attributed to a mere difference in spatial scale (state vs. city)? It would also be helpful to highlight the lockdown period in the plots.}}
+    \label{weekly_county_rural}
+\end{figure}
+%
+{
+\renewcommand{\arraystretch}{1.5} % up/down padding
+\setlength{\tabcolsep}{12pt}      % left/right padding
+\begin{table}[H]
+    \centering
+    \begin{tabular}{l r r r}
+        \rowcolor{gray!5}
+         & 15 January - 15 March & 15 March - 15 May & 15 May - September \\
+        \rowcolor{figblue!20}
+        15 January - 15 March & 1 & 0.8 & 0.8 \\
+        \rowcolor{figorange!20}
+        15 March - 15 May     &   &  1  & 0.5 \\
+        \rowcolor{figgreen!20}
+        15 May - September    &   &     &  1  \\
+    \end{tabular}
+    \caption{Fraction of people of the first period of comparison, who do not change the most visited places per couple of periods}
+    \label{tabPeopleCal}
+\end{table}
+}
+%
+\begin{figure}[h]
+    \centering
+    \includegraphics[width=0.49\textwidth]{figures/main/random_entropy_three_periods_CA.png}
+    \includegraphics[width=0.49\textwidth]{figures/main/uncorrelated_entropy_three_periods_CA.png}
+    \includegraphics[width=0.49\textwidth]{figures/main/real_entropy_three_periods_CA}
+    \includegraphics[width=0.49\textwidth]{figures/main/compression_rate_15 may - sept (3).png}
+    \caption{Distribution (from left to right, top to bottom). Random entropy, Uncorrelated entropy, Real entropy: during lockdown, the distributions are moved on the left with respect to the other two periods, indicating in all three cases less complexity. On the bottom right is shown the ratio between Random and Real entropy. This plot highlights that during lockdown restrictions, real entropy is closer to the random with respect to the other periods. This means that even though all three measures suggest that the complexity of the trajectories is smaller during lockdown, the main contribution to complexity (uncertainty) relies on the total number of visited places.}
+    \label{entropic_measures_california}
+\end{figure}
+
+
+
+
+\end{document}
+
+
+%%%%%% Ingore
+%\begin{align}
+%D_\mu &=  \partial_\mu - ig \frac{\lambda^a}{2} A^a_\mu \nonumber \\
+%F^a_{\mu\nu} &= \partial_\mu A^a_\nu - \partial_\nu A^a_\mu + g f^{abc} A^b_\mu A^a_\nu \label{eq2}
+%\end{align}
+%%%%%%%%%
+
+
+
+

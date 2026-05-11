@@ -411,7 +411,7 @@ class ParquetStore:
                     f.unlink(missing_ok=True)
             if not frames:
                 return cp
-            pl.concat(frames, how="vertical_relaxed").write_parquet(
+            pl.concat(frames, how="diagonal_relaxed").write_parquet(
                 cp, compression="snappy"
             )
 
@@ -491,7 +491,7 @@ class ParquetStore:
             return None
         return pl.concat(
             [pl.read_parquet(f) for f in shards],
-            how="vertical_relaxed",
+            how="diagonal_relaxed",
         )
 
     # ------------------------------------------------------------------
@@ -1045,35 +1045,44 @@ class ParquetStore:
         dict[str, bool]
             ``{kind: success}`` mapping.
         """
+        import traceback as _tb
         results: dict[str, bool] = {}
         for kind in list(FIXED_LENGTH_KINDS) + list(LONG_FORMAT_KINDS):
-            local_files = self._shard_files(period, kind)
-            cp_existing = self._consolidated_path(period, kind)
-            if not local_files and not cp_existing.exists():
-                continue
+            try:
+                local_files = self._shard_files(period, kind)
+                cp_existing = self._consolidated_path(period, kind)
+                if not local_files and not cp_existing.exists():
+                    continue
 
-            # Merge all local shard_*.parquet → consolidated.parquet
-            cp = self.consolidate(period, kind)
-            if not cp.exists():
-                results[kind] = False
-                continue
+                # Merge all local shard_*.parquet → consolidated.parquet
+                cp = self.consolidate(period, kind)
+                if not cp.exists():
+                    results[kind] = False
+                    continue
 
-            shard_dir_name = cp.parent.name
-            s3_key = f"{s3_prefix}/{shard_dir_name}/shards/{shard_label}.parquet"
+                shard_dir_name = cp.parent.name
+                s3_key = f"{s3_prefix}/{shard_dir_name}/shards/{shard_label}.parquet"
 
-            if verbose:
-                print(
-                    f"  [S3 upload] {kind} {period!r}"
-                    f" → s3://{s3_bucket}/{s3_key}"
+                if verbose:
+                    print(
+                        f"  [S3 upload] {kind} {period!r}"
+                        f" → s3://{s3_bucket}/{s3_key}"
+                    )
+
+                ok = self.upload_file_to_s3(
+                    cp, s3_bucket, s3_key, endpoint_url,
+                    delete_after=delete_after,
                 )
-
-            ok = self.upload_file_to_s3(
-                cp, s3_bucket, s3_key, endpoint_url,
-                delete_after=delete_after,
-            )
-            results[kind] = ok
-            if verbose:
-                print(f"    {'OK' if ok else 'FAILED (local copy kept)'}")
+                results[kind] = ok
+                if verbose:
+                    print(f"    {'OK' if ok else 'FAILED (local copy kept)'}")
+            except Exception as _kind_exc:
+                print(
+                    f"  [S3 upload] WARNING: {kind} {period!r} failed —"
+                    f" skipping this kind, others continue."
+                    f"\n  {_kind_exc}\n{_tb.format_exc()}"
+                )
+                results[kind] = False
 
         return results
 
@@ -1186,7 +1195,14 @@ class ParquetStore:
                 if kind in FIXED_LENGTH_KINDS:
                     merged = _hconcat_fixed(frames, index_col)
                 else:
-                    merged = pl.concat(frames, how="vertical_relaxed")
+                    merged = pl.concat(frames, how="diagonal_relaxed")
+                    # Drop rows that have null geohash (can appear when old
+                    # migration data with fewer columns is merged with new
+                    # vectorized-pipeline data via diagonal_relaxed).
+                    if kind == "frequency" and "geohash7" in merged.columns:
+                        merged = merged.filter(pl.col("geohash7").is_not_null())
+                    if kind == "gonzalez" and "x_norm" in merged.columns:
+                        merged = merged.filter(pl.col("x_norm").is_not_null())
 
                 # Write merged result locally (in the normal shard dir)
                 cp = self._consolidated_path(period, kind)

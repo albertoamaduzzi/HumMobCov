@@ -762,9 +762,10 @@ def analyze_from_s3_progressive(
                     else:
                         store.consolidate_all(period)
                 except Exception as _upload_exc:
+                    import traceback as _tb
                     print(
                         f"  WARNING: upload/consolidation failed for period {period!r}"
-                        f" — local results preserved, shard marked done.\n  {_upload_exc}"
+                        f" — local results preserved, shard marked done.\n  {_upload_exc}\n{_tb.format_exc()}"
                     )
             print(
                 f"  Cumulative users: "
@@ -837,9 +838,10 @@ def analyze_from_s3_progressive(
                     else:
                         store.consolidate_all(period)
                 except Exception as _upload_exc:
+                    import traceback as _tb
                     print(
                         f"  WARNING: upload/consolidation failed for period {period!r}"
-                        f" — local results preserved, shard marked done.\n  {_upload_exc}"
+                        f" — local results preserved, shard marked done.\n  {_upload_exc}\n{_tb.format_exc()}"
                     )
 
         print(

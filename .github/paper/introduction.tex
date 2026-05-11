@@ -2,19 +2,72 @@
 \begin{document}
 \label{introduction}
 
+The COVID-19 pandemic raised fundamental questions about how to contain the spread
+of a novel disease \cite{LepriCovid, EvaluationCovid} and about the collateral
+effects of containment strategies \cite{CovidEffectEconomy}. In the absence of
+vaccines, Non-Pharmaceutical Interventions (NPIs) were the primary tool adopted by
+governments to limit transmission \cite{NPI1, NPIDD, NPI3}, significantly reshaping
+human behaviour and mobility patterns \cite{SantanaChanges}. Importantly, a
+substantial share of these behavioural changes preceded formal mandates, driven by
+voluntary responses to risk information \cite{Goolsbee2020, Gupta2020, Xiong2020},
+a distinction with direct consequences for how mobility-based models should be
+calibrated. This context provided the scientific community with a large-scale natural
+experiment for developing and evaluating models of epidemic spread
+\cite{model0, model1, model2, model3, model4}.
 
-Facing the unprecedented COVID-19 pandemic raised fundamental questions about how to contain the spread of a novel disease \cite{LepriCovid, EvaluationCovid}, as well as about the collateral effects of containment strategies \cite{CovidEffectEconomy}. In the absence of available vaccinations, Non-Pharmaceutical Interventions (NPIs) were the primary measures adopted by most governments during the initial phase of the pandemic, with the aim of limiting disease transmission, and they played a critical role in epidemic control \cite{NPI1, NPIDD, NPI3}. Lockdown policies and mobility restriction measures were implemented worldwide, significantly reshaping human behaviour and mobility patterns as a direct consequence \cite{SantanaChanges}. This context provided the scientific community with a large-scale natural experiment, enabling the development and evaluation of several models to forecast the spread of COVID-19 across different populations \cite{model0, model1, model2, model3, model4}. In particular, previous research on human mobility has demonstrated that aggregate and (pseudo-)anonymised mobile phone data can support the modelling of the geographical spread of epidemics \cite{HumanProxiesModelling, MobilityMalaria}, while individual mobility data inferred from mobile phone records have been shown to be instrumental in modelling spatial transmission dynamics \cite{Finger2016, LepriCovid}. Even more precisely, estimates of contact patterns have been obtained from GPS trajectories and data provided by location service providers \cite{Alessandretti, model0, Chang2021, Kraemer2020}.
+Aggregate and anonymised mobile phone data have long been shown to support the
+modelling of epidemic geography \cite{HumanProxiesModelling, MobilityMalaria}, while
+individual GPS trajectories enable finer estimates of contact patterns and spatial
+transmission dynamics \cite{Finger2016, LepriCovid, Alessandretti, Chang2021,
+Kraemer2020}. The COVID-19 pandemic catalysed an unprecedented release of such data,
+from aggregated public indices \cite{GoogleMobility, AppleMobility} to
+privacy-enhanced individual-level datasets \cite{Chang2021, lucchini}, enabling
+analyses at scales previously unavailable. These datasets are nonetheless subject to
+demographic sampling biases that must be accounted for when drawing population-level
+inferences \cite{Wesolowski2013, Zhao2016, Li2024}.
 
-However, the available data often present important limitations. For instance, they may represent only a partial sample of the population, be accessible exclusively in aggregated forms, or be available at a spatial granularity that differs from the desired level of analysis \cite{Gatto2020, Bertuzzo2020, Balcan2009a}. As a result, studies of spreading processes frequently complement real-world data with probabilistic assumptions or mobility models designed to estimate flows between locations and the associated probabilities of contact \cite{Aleta2020, Arenas2020, HumanProxiesModelling, CiofidegliAtti2008}. The validity of these models may be compromised by the altered characteristics in mobility patterns induced by restriction measures \cite{lucchini, Schlosser2020a}, and conservative approaches that simply rescale mobility levels may prove inadequate. One of the goals of this study is to address this issue. Specifically, we investigate how metrics that quantify individual mobility patterns vary under stringent mobility restrictions, with a particular focus on those implemented during the COVID-19 pandemic.
+Mobility data are often partial, aggregated, or available at mismatched spatial
+scales \cite{Gatto2020, Bertuzzo2020, Balcan2009a}, leading studies to complement
+them with probabilistic mobility models \cite{Aleta2020, Arenas2020,
+HumanProxiesModelling, CiofidegliAtti2008}. The validity of such models is
+compromised when restriction measures alter the underlying mobility patterns
+\cite{lucchini, Schlosser2020a}, and simple rescaling approaches prove inadequate.
+The reduction in mobility was itself heterogeneous: sharp differences have been
+documented along income gradients \cite{Weill2020}, urban--rural divides
+\cite{Li2020}, and partisan lines \cite{Allcott2020, Grossman2020}. Recovery
+dynamics after restrictions were lifted showed similar heterogeneity across
+jurisdictions and political contexts \cite{Kim2021, Nguyen2020}. Understanding this
+variability --- and whether standard statistical descriptions of human mobility
+remain valid under forced restrictions --- is the central motivation of this work.
 
+The relationship between trip counts, contacts, and transmission probability did not
+remain constant across pandemic phases, driven by shifting levels of public awareness
+\cite{nouvellet, rg_forecast_deaths}, making it challenging to infer viral spread
+from mobility data alone \cite{Alessandretti}. We address this by providing a
+comprehensive individual-level analysis across three dimensions: geometric measures,
+visitation patterns, and information-theoretic complexity.
 
-Until now, most studies have relied on the assumption of a relationship between the number of trips and the number of contacts, as well as between the number of contacts and the probability of transmission. Empirical evidence has shown that this relationship did not remain constant across the different phases of the pandemic, shaping differently according to the stage and driven by the levels of public awareness \cite{nouvellet, rg_forecast_deaths}. As a result, inferring information about viral spread solely from observations of human mobility remains a significant challenge \cite{Alessandretti}. Despite these difficulties, this scenario presents scientists with a valuable opportunity to develop a quantitative description of the effect on mobility during a pandemic crisis. Particularly, it allows for testing the robustness of individual mobility patterns in response to restrictions implemented to limit social contact and the identification of the factors that have the potential to reshape such patterns 
+We analyse a large, privacy-enhanced longitudinal GPS dataset comprising over
+$180{,}000$ anonymised trajectories from Massachusetts and over $1{,}000{,}000$ from
+California, covering January to September 2020. The observation period is divided
+into three phases \cite{lockdown}: pre-restriction (15 January -- 15 March),
+lockdown (15 March -- 15 May, when more than 40 U.S.\ states issued shelter-in-place
+orders), and post-restriction (15 May -- end of September).
 
-
-In this work, we aim to quantify these effects by measuring individual mobility patterns. We analyse a large, privacy-enhanced longitudinal GPS dataset comprising over $180,000$ anonymised, opted-in individual trajectories from residents of Massachusetts and more than $1,000,000$ trajectories from California, covering the period from January to September 2020. Our analysis replicates and extends methodologies introduced in previous seminal studies on the statistical characterisation of human mobility. We partition and focus the observation period into three distinct phases according to the timing of stay-at-home orders \cite{lockdown}: from 15 January to 15 March (before the implementation of restrictions), from 15 March to 15 May (when more than $40$ U.S. states issued some form of shelter-in-place order), and from 15 May to the end of September (corresponding to the spring–summer period, during which most restrictions were lifted).
-
-
-For starters, a widely used geometrical quantity measuring how far from some central place a person is willing to move is the radius of gyration. We test, in particular, the effects that political colour and the urbanity area play in this measure. This is accompanied by the geodesic distance, which usually is distributed according to a power-law (\cite{radius_gyration},\cite{brockel}). Another measure of interest is the exploration curve that indicates the rate of discovery of new places, and it is well fitted by positive power laws describing diffusive behaviour \cite{scaling_visitation}. To describe how people occupy the area around themselves in a comparable way, we compute the distribution of places visited, observed in the intrinsic reference frame  \cite{radius_gyration}. We further put our attention on the complexity and predictability of the trajectories. We use three different entropy measures: the Random entropy, which depends on the number of visited places; the Shannon, which adds the dependency on the relative frequency of visits, assuming subsequent visits are independent; and in the end Lempel-Ziv estimation (Real entropy), which also considers the order in which visits are done \cite{entropic_measures}. These different measures allow a progressively finer view of the trajectories, adding different aspects that contribute to the description of the complexity of a single path.  Finally, we propose returner-explorers analysis \cite{pappalardo_returners}.
-
+We measure the radius of gyration \cite{radius_gyration} and test whether county-level
+political affiliation and urbanisation modulate it across phases. Trip-length
+distributions follow a power law \cite{radius_gyration, brockel} whose shape we
+examine under restriction. The rate of discovery of new places follows a diffusive
+power law \cite{scaling_visitation}, and the rank structure of visitation frequencies
+obeys a universal law \cite{scaling_visitation, Schlapfer2021} which we test for
+stability. We further compute stop-point distributions in each trajectory's intrinsic
+reference frame \cite{radius_gyration}. For trajectory complexity, we use three
+entropy measures --- random, Shannon, and Lempel-Ziv real entropy
+\cite{entropic_measures, Lu2013} --- which progressively add sensitivity to visit
+frequency, sequential structure, and the regularity of return behaviour
+\cite{Teixeira2021, Cuttone2016}. Whether complexity reduction during lockdown
+reflects a structural change in trajectories or simply fewer visited locations is one
+of the central questions we address. Finally, we apply a returner--explorer framework
+\cite{pappalardo_returners} to characterise shifts in habitual versus novel movement.
 
 \end{document}

@@ -1,0 +1,26 @@
+ [timing] weekly_rg: 16.4s (vectorized, Polars)
+  [vectorized] Period '15 march - 15 may': done.
+  Period '15 may - sept': 15,080 users …
+  [vectorized] Period '15 may - sept': 15,080 pending users
+  [compute] radius_of_gyration ... 0.4s
+  [compute] random_entropy ... 0.3s
+  [compute] uncorrelated_entropy ... 0.3s
+  [compute] real_entropy [LZ78] ... 4.6s
+  [compute] distance ... 0.3s
+  [compute] fraction_time ... 0.0s
+  [compute] home ... 0.3s
+  [compute] k_radius_of_gyration ... 1.4s
+  [timing] county_assignment: 0.1s
+  [timing] scalar metrics: 7.8s total
+  [compute] gonzalez ...
+                                                                   
+ 3.0s
+  [compute] S(t) ...
+                                                               
+ 9.3s
+  [compute] frequency ...
+                                                                    
+ 3.7s
+                                                            
+  [timing] weekly_rg: 30.5s (vectorized, Polars)
+  [vectorized] Period '15 may - sept': done.

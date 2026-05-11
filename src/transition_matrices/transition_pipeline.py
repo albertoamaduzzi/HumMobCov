@@ -55,7 +55,7 @@ Usage
 ...     delta_time_h     = 1,
 ...     endpoint_url     = "https://s3.atlas.fbk.eu",
 ...     bucket           = "chub-datalake",
-...     s3_prefix        = "shared/cuebiq/MOBS/final_pipeline/CA/transition_matrices",
+...     s3_prefix        = "final_pipeline/CA/transition_matrices",
 ...     temp_dir         = None,    # uses /tmp by default
 ...     keep_local       = False,   # delete after upload (default)
 ... )
@@ -498,7 +498,7 @@ class TransitionPipeline:
         S3 bucket.  Default ``"chub-datalake"``.
     s3_prefix : str
         Key prefix for this pipeline's output inside the bucket.
-        Default ``"shared/cuebiq/MOBS/final_pipeline/{region}/transition_matrices"``.
+        Default ``"final_pipeline/{region}/transition_matrices"``.
     temp_dir : Path or str, optional
         Local directory for transient temp files.  Defaults to
         ``/tmp/humobcov_transitions``.
@@ -543,7 +543,7 @@ class TransitionPipeline:
         region: str = getattr(dataset, "id_", "CA")
         if s3_prefix is None:
             s3_prefix = (
-                f"shared/cuebiq/MOBS/final_pipeline/{region}/transition_matrices"
+                f"final_pipeline/{region}/transition_matrices"
             )
         self.s3_prefix = s3_prefix
 

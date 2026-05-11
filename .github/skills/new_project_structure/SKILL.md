@@ -282,13 +282,17 @@ Resume is O(1) — the cache is downloaded once per run.
 **`analyze_from_dataset(dataset, name, store, n_workers=1, use_vectorized=False)`**
 — processes local raw parquets.
 
-**`analyze_from_s3_progressive(dataset, name, store, ..., n_workers=1, use_vectorized=False)`**:
-- Downloads one shard at a time from S3.
-- When `use_vectorized=True`: calls `preprocess_shard_polars()` + `compute_all_polars()`
-  directly — pandas and skmob are never touched for that shard.
-- Checkpoint file `shard_checkpoint_{region}.json` tracks completed shards.
-- Deletes local shard copy after processing.
-- Fully resume-safe.
+**`analyze_from_s3_progressive(dataset, name, store, ..., n_workers=1, use_vectorized=False, output_bucket=None, output_s3_prefix=None, ...)`**:
+- Downloads one shard at a time from S3 to a temp dir.
+- When `use_vectorized=True`: calls `preprocess_shard_polars()` + `compute_all_polars()` — pandas/skmob never touched.
+- After each successful shard: consolidates local output, uploads to
+  `{output_s3_prefix}/{kind_dir}/shards/{shard_label}.parquet` on S3,
+  deletes local output files → **no output accumulates on local disk**.
+- After all shards: calls `store.consolidate_s3_shards()` to download
+  per-shard S3 files, merge, write final `consolidated.parquet` on S3.
+- Checkpoint file `shard_checkpoint_np_{np_}_t_{t}.json` tracks completed shards.
+- Deletes local raw shard copy after processing.
+- Fully resume-safe at both shard level and within-shard user level.
 
 ### `utils.py`
 
@@ -347,16 +351,127 @@ match the old pipeline's capabilities plus enhancements:
 | Only legacy per-user CSV.gz files exist | `store.migrate_all_periods()` one-time migration |
 | Parquet store already populated | skip to visualisation |
 
+---
+
+## Completion and resume semantics (CRITICAL)
+
+The pipeline must be able to answer at any time: **"which computations are done and which are not?"**
+The answer depends on the execution mode — do NOT conflate them.
+
+### Mode A/B — raw trajectories (`raw_trajectories=true`)
+
+**Unit of work = raw input SHARD** (one `.parquet` file from S3 or local disk).
+
+**Completion signal = shard checkpoint file**, NOT store contents:
+```
+milestones_analysis/{REGION}/shard_checkpoint_np_{np_}_t_{t}.json
+{"completed": ["shared/cuebiq/.../shard_001.parquet", ...]}
+```
+
+A period is only fully done when **every** S3 key under the region prefix
+appears in `completed`.  Checking store contents alone is WRONG — after
+processing 1-of-N shards, all metric kinds (scalars, gonzalez, S(t), freq)
+will be internally consistent with each other but represent only a fraction
+of users.
+
+**Resume rule in `main.py` / `main.ipynb`:**
+```python
+use_shard_resume = bool(cfg.get("raw_trajectories"))
+if use_shard_resume:
+    periods_done = []          # always enter the pipeline
+    periods_todo = list(PERIOD_NAMES)
+```
+The inner functions `analyze_from_s3_progressive` and `analyze_from_dataset`
+manage their own shard-level and user-level resume — they skip already-done
+shards/users automatically.
+
+### Mode C — legacy migration (`raw_trajectories=false`)
+
+**Unit of work = individual USER** (read from legacy CSV.gz / JSON files).
+
+**Completion signal = store contents**: a period is "done" if
+`store.get_computed_users(period, "all_scalars")` is non-empty.
+Migration methods (`migrate_all_periods`, `migrate_all_periods_MA`) skip
+already-migrated users by reading parquet footer metadata (O(1)).
+
+**Resume rule:**
+```python
+periods_done = [p for p in PERIOD_NAMES
+                if len(store.get_computed_users(p, "all_scalars")) > 0]
+periods_todo = [p for p in PERIOD_NAMES if p not in periods_done]
+```
+
+### Progress inspection at any time
+
+```bash
+# How many shards completed vs total (S3 mode)
+python3 -c "
+import json
+with open('milestones_analysis/CA/shard_checkpoint_np_20_t_1.json') as f:
+    d = json.load(f)
+print('done shards:', len(d['completed']))
+"
+
+# How many users per kind per period (all modes)
+python3 -c "
+import sys; sys.path.insert(0, '.')
+from src.store import ParquetStore
+from src.constants import DIR_MILESTONES_SERVER, PERIOD_NAMES
+store = ParquetStore(DIR_MILESTONES_SERVER / 'CA', np_=20, t_threshold=1)
+for p in PERIOD_NAMES:
+    sc = len(store.get_computed_users(p, 'all_scalars'))
+    go = len(store.get_computed_users_long(p, 'gonzalez'))
+    st = len(store.get_computed_users(p, 'S'))
+    fr = len(store.get_computed_users_long(p, 'frequency'))
+    print(f'{p}: scalars={sc}, gonzalez={go}, S(t)={st}, freq={fr}')
+"
+```
+
 **Recommended call for production:**
 
 ```python
 analyze_from_s3_progressive(
     dataset, "CA", cfg, store,
-    endpoint_url=ENDPOINT, bucket=BUCKET, s3_prefix=S3_PREFIX,
-    batch_size=10_000,
-    use_vectorized=True,   # polars+numba; skips skmob entirely
+    endpoint_url=S3_ENDPOINT_URL, bucket=S3_BUCKET, s3_prefix=S3_RAW_PREFIX["CA"],
+    batch_size=500,
+    n_workers=os.cpu_count(),
+    use_vectorized=True,           # polars+numba; skips skmob entirely
+    output_bucket=S3_OUTPUT_BUCKET,
+    output_s3_prefix=S3_OUTPUT_PREFIX["CA"],
+    delete_local_after_upload=True,  # free local disk immediately
 )
 ```
+
+### Output storage architecture (CRITICAL)
+
+Raw input data and computed output data are kept on S3.
+**Local disk is only a temporary buffer.**
+
+```
+S3 input (raw trajectories):
+  s3://chub-datalake/shared/cuebiq/MOBS/urban_rural_flow.../shard_001.parquet
+     ↓ download → process → delete
+Local temp (~temp_dir):
+  only one shard at a time while being computed
+     ↓ write output locally during computation
+Local store (~milestones_analysis/):
+  shard_TIMESTAMP.parquet  (one shard's worth of output, one metric at a time)
+     ↓ consolidate + upload + delete after each shard completes
+S3 output (per-shard):
+  s3://chub-datalake/shared/cuebiq/MOBS/final_pipeline/CA/
+    {kind}_period_{period}_np_{np_}_t_{t}/shards/{shard_label}.parquet
+     ↓ consolidate_s3_shards() at the end (downloads, merges, re-uploads)
+S3 output (final):
+  s3://chub-datalake/shared/cuebiq/MOBS/final_pipeline/CA/
+    {kind}_period_{period}_np_{np_}_t_{t}/consolidated.parquet
+```
+
+The `get_computed_users` / `get_computed_users_long` check reads the **local**
+parquet footer only.  This is correct because:
+- Completed shards have their local output already deleted → returns {} → correct
+  (we skip those shards entirely via the checkpoint, so we never call this for them)
+- The currently-processing shard may have partial local output (from an interrupted
+  previous run) → returns those users → correctly skips them within the shard
 
 ---
 

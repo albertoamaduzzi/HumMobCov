@@ -28,6 +28,7 @@ Sections
 """
 
 import argparse
+import os as _os_pre
 import sys
 from pathlib import Path
 
@@ -35,6 +36,19 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent   # HumMobCov/
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# ─── Cap Polars thread pool to the real cgroup CPU quota ─────────────────────
+# Must happen BEFORE polars is imported (happens transitively via src below).
+# os.cpu_count() / sched_getaffinity both return host CPUs in a container;
+# the cgroup v2 cpu.max file gives the actual quota.
+try:
+    with open("/sys/fs/cgroup/cpu.max") as _f:
+        _quota, _period = _f.read().split()
+    if _quota != "max":
+        _n_real = max(1, int(float(_quota) / float(_period)))
+        _os_pre.environ.setdefault("POLARS_NUM_THREADS", str(_n_real))
+except Exception:
+    pass
 
 from src import (
     # constants
@@ -58,6 +72,7 @@ from src import (
 from src.constants import (
     DIR_MILESTONES_SERVER,
     S3_ENDPOINT_URL, S3_BUCKET, S3_RAW_PREFIX, DIR_SHARD_TEMP,
+    S3_OUTPUT_BUCKET, S3_OUTPUT_PREFIX,
 )
 import numpy as np
 import pandas as pd
@@ -115,19 +130,6 @@ def parse_args():
     parser.add_argument(
         "--batch-size", type=int, default=500,
         help="Users per parquet shard write (S3 / local raw modes).",
-    )
-    parser.add_argument(
-        "--consolidate-every", type=int, default=1,
-        help="Consolidate store every N shards in S3 mode.",
-    )
-    parser.add_argument(
-        "--workers", dest="n_workers", type=int, default=None,
-        help=(
-            "Number of parallel worker processes. "
-            "Vectorized mode: used for real_entropy / S(t) / Gonzalez. "
-            "Legacy mode: used for the full per-user skmob loop. "
-            "Defaults to os.cpu_count()."
-        ),
     )
     parser.add_argument(
         "--no-vectorized", dest="use_vectorized", action="store_false",
@@ -216,20 +218,36 @@ def section_main(args, dataset, cfg):
     )
 
     # ── Check what is already computed ───────────────────────────────────────
-    periods_done = [
-        p for p in PERIOD_NAMES
-        if len(store.get_computed_users(p, "all_scalars")) > 0
-    ]
-    periods_todo = [p for p in PERIOD_NAMES if p not in periods_done]
+    # For S3 / local-raw modes the real completion signal is the shard
+    # checkpoint: a period is "done" only when every raw shard has been
+    # processed.  We cannot infer that from store contents alone, because a
+    # partial run (1-of-N shards) produces a fully-consistent store that
+    # would wrongly appear complete.
+    #
+    # Strategy:
+    #   - S3 / local-raw modes: delegate entirely to analyze_from_s3_progressive
+    #     / analyze_from_dataset — they manage their own resume logic.
+    #     periods_todo = all periods (the inner functions skip already-done users).
+    #   - Legacy migration modes (no raw_trajectories): a period is done when
+    #     all_scalars has any users (migration is user-granular and resume-safe).
+    use_shard_resume = bool(cfg.get("raw_trajectories"))
 
-    import os as _os
-    n_workers = args.n_workers if args.n_workers is not None else (_os.cpu_count() or 1)
+    if use_shard_resume:
+        # Always enter the pipeline; inner resume logic handles skipping.
+        periods_done = []
+        periods_todo = list(PERIOD_NAMES)
+    else:
+        periods_done = [
+            p for p in PERIOD_NAMES
+            if len(store.get_computed_users(p, "all_scalars")) > 0
+        ]
+        periods_todo = [p for p in PERIOD_NAMES if p not in periods_done]
+
     use_vectorized = args.use_vectorized
 
     print(f"Periods already in store  : {periods_done or 'none'}")
     print(f"Periods still to compute  : {periods_todo or 'none'}")
     print(f"Compute path              : {'vectorized (polars)' if use_vectorized else 'legacy (skmob)'}")
-    print(f"Worker processes          : {n_workers}  [logical CPUs: {_os.cpu_count()}]")
 
     if not periods_todo:
         print("Parquet store already populated for all periods. Nothing to do.")
@@ -247,12 +265,20 @@ def section_main(args, dataset, cfg):
                 output_dir      = args.output_dir,
                 store           = store,
                 batch_size      = args.batch_size,
-                n_workers       = n_workers,
                 use_vectorized  = use_vectorized,
             )
             print("Computation complete. Consolidating shards…")
             for p in dataset.period_names:
                 store.consolidate_all(p)
+            print("Uploading results to S3…")
+            store.upload_all_to_s3(
+                period_names  = dataset.period_names,
+                s3_bucket     = S3_OUTPUT_BUCKET,
+                s3_prefix     = S3_OUTPUT_PREFIX[args.region],
+                endpoint_url  = s3_endpoint,
+                delete_after  = False,
+                consolidate_first = False,
+            )
             print("Done.")
 
         # ── CASE B: S3 progressive (download one shard → compute → delete) ───
@@ -275,9 +301,11 @@ def section_main(args, dataset, cfg):
                 s3_prefix         = s3_prefix,
                 temp_dir          = temp_dir,
                 batch_size        = args.batch_size,
-                consolidate_every = args.consolidate_every,
-                n_workers         = n_workers,
                 use_vectorized    = use_vectorized,
+                output_endpoint_url        = s3_endpoint,
+                output_bucket              = S3_OUTPUT_BUCKET,
+                output_s3_prefix           = S3_OUTPUT_PREFIX[args.region],
+                delete_local_after_upload  = True,
             )
 
         # ── CASE C-CA: migrate legacy dataxuser per-user CSV.gz files ─────────
@@ -296,6 +324,15 @@ def section_main(args, dataset, cfg):
                     t            = dataset.t_threshold,
                     batch_size   = 5000,
                     consolidate  = True,
+                )
+                print("Uploading results to S3…")
+                store.upload_all_to_s3(
+                    period_names  = dataset.period_names,
+                    s3_bucket     = S3_OUTPUT_BUCKET,
+                    s3_prefix     = S3_OUTPUT_PREFIX[args.region],
+                    endpoint_url  = s3_endpoint,
+                    delete_after  = False,
+                    consolidate_first = False,
                 )
             else:
                 print(
@@ -319,6 +356,15 @@ def section_main(args, dataset, cfg):
                 t              = dataset.t_threshold,
                 batch_size     = 2000,
                 consolidate    = True,
+            )
+            print("Uploading results to S3…")
+            store.upload_all_to_s3(
+                period_names  = dataset.period_names,
+                s3_bucket     = S3_OUTPUT_BUCKET,
+                s3_prefix     = S3_OUTPUT_PREFIX[args.region],
+                endpoint_url  = s3_endpoint,
+                delete_after  = False,
+                consolidate_first = False,
             )
 
         else:

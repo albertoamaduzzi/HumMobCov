@@ -380,15 +380,37 @@ class ParquetStore:
         if kind in FIXED_LENGTH_KINDS:
             frames: list[pl.DataFrame] = []
             if cp.exists():
-                frames.append(pl.read_parquet(cp))
-            frames.extend(pl.read_parquet(f) for f in shards)
+                try:
+                    frames.append(pl.read_parquet(cp))
+                except Exception as _e:
+                    print(f"  [store] WARNING: dropping corrupt consolidated file {cp.name}: {_e}")
+                    cp.unlink(missing_ok=True)
+            for f in shards:
+                try:
+                    frames.append(pl.read_parquet(f))
+                except Exception as _e:
+                    print(f"  [store] WARNING: dropping corrupt shard {f.name}: {_e}")
+                    f.unlink(missing_ok=True)
+            if not frames:
+                return cp
             merged = _hconcat_fixed(frames, _INDEX_COL[kind])
             merged.write_parquet(cp, compression="snappy")
         else:
             frames = []
             if cp.exists():
-                frames.append(pl.read_parquet(cp))
-            frames.extend(pl.read_parquet(f) for f in shards)
+                try:
+                    frames.append(pl.read_parquet(cp))
+                except Exception as _e:
+                    print(f"  [store] WARNING: dropping corrupt consolidated file {cp.name}: {_e}")
+                    cp.unlink(missing_ok=True)
+            for f in shards:
+                try:
+                    frames.append(pl.read_parquet(f))
+                except Exception as _e:
+                    print(f"  [store] WARNING: dropping corrupt shard {f.name}: {_e}")
+                    f.unlink(missing_ok=True)
+            if not frames:
+                return cp
             pl.concat(frames, how="vertical_relaxed").write_parquet(
                 cp, compression="snappy"
             )
@@ -986,6 +1008,214 @@ class ParquetStore:
     # S3 synchronisation
     # ------------------------------------------------------------------
 
+    def upload_shard_to_s3_unique(
+        self,
+        period: str,
+        shard_label: str,
+        s3_bucket: str,
+        s3_prefix: str,
+        endpoint_url: str,
+        delete_after: bool = True,
+        verbose: bool = True,
+    ) -> dict[str, bool]:
+        """
+        Consolidate local shard files for (period) and upload each metric
+        kind to a **unique per-shard key** on S3, preserving outputs from
+        all previous shards.
+
+        Key pattern::
+
+            {s3_prefix}/{kind}_period_{period}_np_{np_}_t_{t}/shards/{shard_label}.parquet
+
+        Use this during incremental S3-progressive computation so that each
+        shard's output is written immediately and local files can be deleted.
+        Call ``consolidate_s3_shards()`` once at the end to merge everything
+        into the final ``consolidated.parquet``.
+
+        Parameters
+        ----------
+        shard_label : str
+            Unique, stable identifier for this shard (e.g. an MD5 hash of
+            the raw S3 shard key).
+        delete_after : bool
+            Delete the local consolidated file after a successful upload.
+
+        Returns
+        -------
+        dict[str, bool]
+            ``{kind: success}`` mapping.
+        """
+        results: dict[str, bool] = {}
+        for kind in list(FIXED_LENGTH_KINDS) + list(LONG_FORMAT_KINDS):
+            local_files = self._shard_files(period, kind)
+            cp_existing = self._consolidated_path(period, kind)
+            if not local_files and not cp_existing.exists():
+                continue
+
+            # Merge all local shard_*.parquet → consolidated.parquet
+            cp = self.consolidate(period, kind)
+            if not cp.exists():
+                results[kind] = False
+                continue
+
+            shard_dir_name = cp.parent.name
+            s3_key = f"{s3_prefix}/{shard_dir_name}/shards/{shard_label}.parquet"
+
+            if verbose:
+                print(
+                    f"  [S3 upload] {kind} {period!r}"
+                    f" → s3://{s3_bucket}/{s3_key}"
+                )
+
+            ok = self.upload_file_to_s3(
+                cp, s3_bucket, s3_key, endpoint_url,
+                delete_after=delete_after,
+            )
+            results[kind] = ok
+            if verbose:
+                print(f"    {'OK' if ok else 'FAILED (local copy kept)'}")
+
+        return results
+
+    def consolidate_s3_shards(
+        self,
+        period: str,
+        s3_bucket: str,
+        s3_prefix: str,
+        endpoint_url: str,
+        delete_shards_after: bool = True,
+        verbose: bool = True,
+    ) -> dict[str, bool]:
+        """
+        Download all per-shard parquet files for (period) from S3, merge
+        them into a single ``consolidated.parquet``, and upload the result
+        to S3 under the canonical key::
+
+            {s3_prefix}/{kind}_period_{period}_np_{np_}_t_{t}/consolidated.parquet
+
+        Call this **once** after all shards have been processed and their
+        individual outputs have been uploaded via ``upload_shard_to_s3_unique``.
+
+        Parameters
+        ----------
+        delete_shards_after : bool
+            Delete the individual per-shard S3 files after a successful merge.
+
+        Returns
+        -------
+        dict[str, bool]
+            ``{kind: success}`` mapping.
+        """
+        import subprocess as _sp
+        import tempfile as _tf
+
+        results: dict[str, bool] = {}
+
+        for kind in list(FIXED_LENGTH_KINDS) + list(LONG_FORMAT_KINDS):
+            shard_dir_name = self._shard_dir(period, kind).name
+            s3_shards_prefix = f"{s3_prefix}/{shard_dir_name}/shards"
+            s3_consolidated_key = f"{s3_prefix}/{shard_dir_name}/{CONSOLIDATED_FNAME}"
+
+            # List per-shard files on S3
+            ls = _sp.run(
+                [
+                    "aws", "s3", "ls",
+                    f"s3://{s3_bucket}/{s3_shards_prefix}/",
+                    "--endpoint-url", endpoint_url,
+                ],
+                capture_output=True, text=True,
+            )
+            if ls.returncode != 0 or not ls.stdout.strip():
+                if verbose:
+                    print(
+                        f"  [S3 consolidate] No per-shard files on S3 for"
+                        f" {kind} {period!r} — skipping."
+                    )
+                continue
+
+            s3_keys = [
+                f"{s3_shards_prefix}/{line.split()[-1]}"
+                for line in ls.stdout.splitlines()
+                if line.strip() and line.split()[-1].endswith(".parquet")
+            ]
+            if not s3_keys:
+                continue
+
+            if verbose:
+                print(
+                    f"  [S3 consolidate] {kind} {period!r}:"
+                    f" {len(s3_keys)} shards → merging …"
+                )
+
+            # Download each shard into a temp directory and merge
+            with _tf.TemporaryDirectory(dir=self.base_dir) as tmpdir:
+                frames: list[pl.DataFrame] = []
+                downloaded_keys: list[str] = []
+
+                for s3_key in s3_keys:
+                    fname = Path(s3_key).name
+                    tmp_path = Path(tmpdir) / fname
+                    dl = _sp.run(
+                        [
+                            "aws", "s3", "cp",
+                            f"s3://{s3_bucket}/{s3_key}", str(tmp_path),
+                            "--endpoint-url", endpoint_url,
+                        ],
+                        capture_output=True, text=True,
+                    )
+                    if dl.returncode != 0:
+                        if verbose:
+                            print(
+                                f"    WARNING: download failed for {s3_key}"
+                                f"\n    {dl.stderr.strip()}"
+                            )
+                        continue
+                    try:
+                        frames.append(pl.read_parquet(tmp_path))
+                        downloaded_keys.append(s3_key)
+                    except Exception as e:
+                        if verbose:
+                            print(f"    WARNING: read failed for {s3_key}: {e}")
+
+                if not frames:
+                    results[kind] = False
+                    continue
+
+                # Merge
+                index_col = _INDEX_COL.get(kind)
+                if kind in FIXED_LENGTH_KINDS:
+                    merged = _hconcat_fixed(frames, index_col)
+                else:
+                    merged = pl.concat(frames, how="vertical_relaxed")
+
+                # Write merged result locally (in the normal shard dir)
+                cp = self._consolidated_path(period, kind)
+                merged.write_parquet(cp, compression="snappy")
+
+            # Upload consolidated.parquet to S3
+            ok = self.upload_file_to_s3(
+                cp, s3_bucket, s3_consolidated_key, endpoint_url,
+                delete_after=True,
+            )
+            results[kind] = ok
+
+            if verbose:
+                print(f"    {'OK' if ok else 'FAILED (local copy kept)'}")
+
+            # Delete per-shard S3 files
+            if delete_shards_after and ok:
+                for s3_key in downloaded_keys:
+                    _sp.run(
+                        [
+                            "aws", "s3", "rm",
+                            f"s3://{s3_bucket}/{s3_key}",
+                            "--endpoint-url", endpoint_url,
+                        ],
+                        capture_output=True, text=True,
+                    )
+
+        return results
+
     def upload_file_to_s3(
         self,
         local_path: Path,
@@ -1008,7 +1238,7 @@ class ParquetStore:
             Destination bucket (e.g. ``"chub-datalake"``).
         s3_key : str
             Full key inside the bucket (e.g.
-            ``"shared/cuebiq/MOBS/final_pipeline/CA/all_scalars_.../consolidated.parquet"``).
+            ``"final_pipeline/CA/all_scalars_.../consolidated.parquet"``).
         endpoint_url : str
             S3-compatible endpoint (e.g. ``"https://s3.atlas.fbk.eu"``).
         delete_after : bool
@@ -1073,7 +1303,7 @@ class ParquetStore:
             Destination bucket.
         s3_prefix : str
             Prefix inside the bucket
-            (e.g. ``"shared/cuebiq/MOBS/final_pipeline/CA"``).
+            (e.g. ``"final_pipeline/CA"``).
         endpoint_url : str
             S3-compatible endpoint URL.
         delete_after : bool

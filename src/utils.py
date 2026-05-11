@@ -225,6 +225,26 @@ def time_difference(start, end) -> float:
 
 # ---------------------------------------------------------------------------
 # File-system helpers
+def get_cpu_quota() -> int:
+    """
+    Return the number of CPUs actually available to this process.
+
+    On Linux containers (Docker / Kubernetes) ``os.cpu_count()`` reports
+    *all host CPUs*, not the cgroup quota.  This function reads the real
+    quota from the cgroup v2 ``cpu.max`` file (``<quota> <period>``).
+    Falls back to ``os.cpu_count()`` if the file is absent or unparseable.
+    """
+    import os as _os
+    try:
+        with open("/sys/fs/cgroup/cpu.max") as f:
+            quota_str, period_str = f.read().split()
+        if quota_str != "max":
+            return max(1, int(float(quota_str) / float(period_str)))
+    except Exception:
+        pass
+    return _os.cpu_count() or 1
+
+
 # ---------------------------------------------------------------------------
 
 def ifnotexistsmkdir(dir_: Path | str) -> Path:

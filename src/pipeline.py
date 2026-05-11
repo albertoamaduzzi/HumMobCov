@@ -34,7 +34,6 @@ import subprocess
 import time
 from pathlib import Path
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -50,100 +49,6 @@ from .constants import DIR_OUTPUT, DIR_CONFIG, DIR_MILESTONES_SERVER, DIR_SHARD_
 
 if TYPE_CHECKING:
     from .store import ParquetStore
-
-
-# ---------------------------------------------------------------------------
-# Worker-pool infrastructure (process-level parallelism)
-# ---------------------------------------------------------------------------
-
-_g_worker_state: dict = {}  # populated by _init_worker in each worker process
-
-
-def _init_worker(cfg: dict, shared_data: dict) -> None:
-    """Called once per worker process to load shared read-only state."""
-    global _g_worker_state
-    _g_worker_state = {"cfg": cfg, **shared_data}
-
-
-def _run_user_worker(uid_str: str, user_df) -> dict:
-    """
-    Compute all enabled metrics for one user.  Runs inside a worker process
-    and returns a result dict to the main process for batch writing.
-    """
-    state         = _g_worker_state
-    cfg           = state["cfg"]
-    period        = state["period"]
-    region        = state["region"]
-    np_           = state["np_"]
-    t_threshold   = state["t_threshold"]
-    p2div         = state["period_names2period_division"]
-    period_div    = state["period_division"]
-    perodname2idx = state["perodname2idx"]
-    geojson       = state.get("geojson")
-    county2party  = state.get("county2party", {})
-    county2rural  = state.get("county2rural", {})
-    raw           = cfg.get("raw_trajectories", False)
-
-    ciccio = User(user_df, period, region, np_, t_threshold, p2div)
-    ciccio.time_filtering_traj_per_person(t_threshold)
-
-    result: dict = {
-        "uid":      uid_str,
-        "n_points": len(ciccio.df),
-        "scalars":  None,
-        "gonzalez": None,
-        "st":       None,
-        "freq":     None,
-        "wrg":      None,
-        "weeks":    None,
-    }
-
-    if cfg.get("is_weekly_radius_gyration"):
-        weeks = ciccio.divide_weeks(period_div, period, perodname2idx)
-        _dummy_w2p = {str(w): 0 for w in weeks}
-        ciccio.compute_weekly_radius_gyration(period, _dummy_w2p, period_div, perodname2idx)
-        result["wrg"]   = dict(ciccio.week2rg)
-        result["weeks"] = [str(w) for w in weeks]
-
-    def _run_if(flag: str, already_flag: str, method_name: str) -> None:
-        if cfg.get(flag) and not cfg.get(already_flag) and raw:
-            getattr(ciccio, method_name)()
-
-    _run_if("is_radius_gyration",       "already_computed_rg",                  "compute_radius_of_gyration")
-    _run_if("is_random_entropy",        "already_computed_random_entropy",       "compute_random_entropy")
-    _run_if("is_uncorrelated_entropy",  "already_computed_uncorrelated_entropy", "compute_uncorrelated_entropy")
-    _run_if("is_real_entropy",          "already_computed_real_entropy",         "compute_real_entropy")
-    _run_if("is_distance",              "already_computed_distance",             "compute_straight_line_distance")
-    _run_if("is_home",                  "already_computed_home",                 "compute_home")
-    _run_if("is_krg",                   "already_computed_krg",                  "compute_krg")
-    _run_if("is_fraction_time",         "already_computed_fraction_time",        "compute_fraction_time_user_is_present")
-
-    if cfg.get("is_county_rural") and not cfg.get("already_computed_county_rural"):
-        ciccio._get_county(geojson, county2party, county2rural)
-
-    if cfg.get("is_gonzalez") and not cfg.get("already_computed_gonzalez") and raw:
-        ciccio.compute_gonzalez()
-        import pandas as _pd
-        gdf = getattr(ciccio, "df2save_gonzalez", None)
-        _GON_COLS = {"x_norm", "y_norm", "sigmax", "sigmay"}
-        if (
-            isinstance(gdf, _pd.DataFrame)
-            and not gdf.empty
-            and _GON_COLS.issubset(gdf.columns)
-        ):
-            result["gonzalez"] = gdf
-    if cfg.get("is_St") and not cfg.get("already_computed_St") and raw:
-        ciccio.compute_St()
-        if hasattr(ciccio, "df_St"):
-            result["st"] = ciccio.df_St["visited_places"].tolist()
-
-    if cfg.get("is_frequency") and not cfg.get("already_computed_frequency") and raw:
-        ciccio.compute_frequency_location()
-        if hasattr(ciccio, "df2frequencyrank"):
-            result["freq"] = ciccio.df2frequencyrank
-
-    result["scalars"] = dict(ciccio.df2save)
-    return result
 
 
 # ---------------------------------------------------------------------------
@@ -191,7 +96,6 @@ def compute_all(
     output_dir: Path | str | None = None,
     store: "ParquetStore | None" = None,
     batch_size: int = 500,
-    n_workers: int = 1,
     use_vectorized: bool = False,
 ) -> dict:
     """
@@ -218,14 +122,6 @@ def compute_all(
     batch_size : int
         Number of users to accumulate before flushing to the store.
         Ignored when ``store`` is None.
-    n_workers : int
-        Number of parallel worker processes for metric computation.
-        ``1`` (default) runs serially.  Values ``> 1`` use
-        ``ProcessPoolExecutor``; set to ``os.cpu_count()`` or a fraction
-        thereof to saturate all available cores.  Only active in
-        ``raw_trajectories`` mode.  In the vectorized path, used to
-        parallelize the GIL-bound ``map_groups`` metrics (real_entropy,
-        S(t), Gonzalez); polars expression metrics always use all threads.
     use_vectorized : bool
         When ``True``, bypass the per-user loop entirely and delegate to
         :func:`~src.vectorized_pipeline.compute_all_polars`.  Requires
@@ -280,7 +176,7 @@ def compute_all(
         return _vec_all(
             cfg, dataset, polars_df, period,
             ad_scalars, ad_gonzalez, ad_st, ad_freq, ad_wrg,
-            store, batch_size, n_workers,
+            store, batch_size,
         )
 
     # ── existing per-user path (unchanged) ──────────────────────────────
@@ -349,75 +245,8 @@ def compute_all(
     if df is not None and raw:
         user_groups = {uid: grp for uid, grp in df.period2df[period].groupby("userId")}
 
-    # ── parallel path ──────────────────────────────────────────────────────
-    # Each user's metric computation is independent; spawn n_workers worker
-    # processes to saturate available CPUs.  Batch writes are done serially
-    # in the main process to avoid file-level contention.
-    if n_workers > 1 and raw and user_groups is not None:
-        pending = [
-            u for u in list_users
-            if str(u) not in already_done_scalars and u in user_groups
-        ]
-        shared_data = {
-            "period":                       period,
-            "region":                       dataset.id_,
-            "np_":                          dataset.np_,
-            "t_threshold":                  dataset.t_threshold,
-            "period_names2period_division": dataset.period_names2period_division,
-            "period_division":              df.period_division,
-            "perodname2idx":                df.perodname2idx,
-            "geojson":                      getattr(dataset, "geojson",      None),
-            "county2party":                 getattr(dataset, "county2party", {}),
-            "county2rural":                 getattr(dataset, "county2rural", {}),
-        }
-        with ProcessPoolExecutor(
-            max_workers=n_workers,
-            initializer=_init_worker,
-            initargs=(cfg, shared_data),
-        ) as pool:
-            futures = {
-                pool.submit(_run_user_worker, str(u), user_groups[u]): u
-                for u in pending
-            }
-            for future in as_completed(futures):
-                try:
-                    res = future.result()
-                except Exception as exc:
-                    print(f"[WARN] User {futures[future]} raised: {exc}")
-                    continue
-
-                uid_str = res["uid"]
-                dataset.period2totalpoints[period] += res["n_points"]
-
-                if res["scalars"] is not None:
-                    scalar_batch[uid_str] = res["scalars"]
-                if res["gonzalez"] is not None and uid_str not in already_done_gonzalez:
-                    gonzalez_batch[uid_str] = res["gonzalez"]
-                if res["st"] is not None and uid_str not in already_done_st:
-                    st_batch[uid_str] = res["st"]
-                if res["freq"] is not None and uid_str not in already_done_freq:
-                    freq_batch[uid_str] = res["freq"]
-                if res["wrg"] is not None and uid_str not in already_done_wrg:
-                    wrg_batch[uid_str] = res["wrg"]
-                    if not all_weeks_for_wrg and res["weeks"]:
-                        all_weeks_for_wrg.extend(res["weeks"])
-                    if dictweek2npeople is None and res["weeks"]:
-                        dictweek2npeople = {w: 0 for w in res["weeks"]}
-                    if len(wrg_batch) >= batch_size:
-                        store.write_weekly_rg_batch(period, wrg_batch, all_weeks_for_wrg)
-                        wrg_batch.clear()
-
-                _flush_batches()
-                overall_count += 1
-                if overall_count % 10_000 == 0:
-                    print(f"Processed {overall_count} users in period '{period}'")
-
-    # ── serial path (skipped when parallel workers are active) ─────────────
-    _serial_users = (
-        [] if (n_workers > 1 and raw and user_groups is not None) else list_users
-    )
-
-    for user in _serial_users:
+    # ── serial user loop ────────────────────────────────────────────────────
+    for user in list_users:
         uid_str = str(user)
 
         # ── skip already-computed (resume logic) ──────────────────────────
@@ -577,7 +406,6 @@ def analyze_from_dataset(
     output_dir: Path | str | None = None,
     store: "ParquetStore | None" = None,
     batch_size: int = 500,
-    n_workers: int = 1,
     use_vectorized: bool = False,
 ) -> None:
     """
@@ -599,10 +427,6 @@ def analyze_from_dataset(
         per-file path.
     batch_size : int
         Users per shard write in parquet-store mode.
-    n_workers : int
-        Number of parallel worker processes.  ``1`` (default) = serial.
-        Use ``os.cpu_count()`` or a fraction thereof to saturate CPUs.
-        Ignored when ``use_vectorized=True``.
     use_vectorized : bool
         When ``True``, use the polars/numba vectorized path instead of
         the per-user loop.  Much faster on large shards.  Default ``False``.
@@ -638,7 +462,6 @@ def analyze_from_dataset(
                     output_dir=base_out,
                     store=store,
                     batch_size=batch_size,
-                    n_workers=n_workers,
                     use_vectorized=use_vectorized,
                 )
                 print(
@@ -668,7 +491,6 @@ def analyze_from_dataset(
                 output_dir=base_out,
                 store=store,
                 batch_size=batch_size,
-                n_workers=n_workers,
                 use_vectorized=use_vectorized,
             )
             print(
@@ -681,6 +503,12 @@ def analyze_from_dataset(
 # S3 progressive orchestrator
 # ---------------------------------------------------------------------------
 
+def _shard_label(shard_key: str) -> str:
+    """Return a stable 12-hex label from an S3 shard key (used as per-shard output key)."""
+    import hashlib
+    return hashlib.md5(shard_key.encode()).hexdigest()[:12]
+
+
 def analyze_from_s3_progressive(
     dataset: _BaseDataset,
     region: str,
@@ -692,13 +520,23 @@ def analyze_from_s3_progressive(
     s3_prefix: str,
     temp_dir: Path | None = None,
     batch_size: int = 500,
-    consolidate_every: int = 1,
-    n_workers: int = 1,
     use_vectorized: bool = False,
+    output_endpoint_url: str | None = None,
+    output_bucket: str | None = None,
+    output_s3_prefix: str | None = None,
+    delete_local_after_upload: bool = True,
 ) -> None:
     """
     Download raw Cuebiq parquet shards from S3 one at a time, compute all
     enabled metrics, save results to *store*, then delete the local copy.
+
+    **Output to S3 (recommended)**
+
+    When *output_bucket* and *output_s3_prefix* are supplied, each shard's
+    output is uploaded to S3 immediately after processing and the local
+    files are deleted — no output accumulates on local disk.  A final
+    ``consolidate_s3_shards()`` call merges all per-shard S3 files into the
+    canonical ``consolidated.parquet`` at the end.
 
     This function is designed to be interrupted and restarted safely:
 
@@ -733,18 +571,20 @@ def analyze_from_s3_progressive(
         Defaults to ``DIR_SHARD_TEMP``.
     batch_size : int
         Users to accumulate per parquet shard write.
-    consolidate_every : int
-        Consolidate the parquet store after every *N* processed shards
-        (default 1 = after every shard).  Larger values reduce I/O at the
-        cost of larger individual shard files.
-    n_workers : int
-        Number of parallel worker processes for per-user metric computation.
-        ``1`` (default) = serial.  Use ``os.cpu_count()`` or a capped value
-        (e.g. 32) to saturate available CPUs.
     use_vectorized : bool
         When ``True``, delegate each shard's computation to the polars/numba
         vectorized path (``compute_all_polars``).  Recommended for large shards.
         Default ``False``.
+    output_endpoint_url : str, optional
+        S3 endpoint for the output store.  Defaults to ``endpoint_url``.
+    output_bucket : str, optional
+        Bucket to write output parquet files.  When set, each shard's output
+        is uploaded immediately and local files are deleted.
+    output_s3_prefix : str, optional
+        Key prefix for output files (e.g.
+        ``"final_pipeline/CA"``).
+    delete_local_after_upload : bool
+        Delete local output files after a successful S3 upload (default True).
     """
     _temp_dir = Path(temp_dir) if temp_dir else DIR_SHARD_TEMP
     _temp_dir.mkdir(parents=True, exist_ok=True)
@@ -886,34 +726,54 @@ def analyze_from_s3_progressive(
                 checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
                 with open(checkpoint_path, "w") as _f:
                     json.dump({"completed": sorted(completed_shards)}, _f, indent=2)
-                if (shard_idx + 1) % consolidate_every == 0:
-                    print(f"  Consolidating store …")
-                    for period in dataset.period_names:
-                        store.consolidate_all(period)
-                print(
-                    f"  Cumulative users: "
-                    + "  ".join(
-                        f"{p!r}: {dataset.period2totalusers[p]:,}"
-                        for p in dataset.period_names
-                    )
-                )
-                continue  # → next shard (skip the legacy block below)
 
             # ── Legacy path: pandas / skmob preprocessing ──────────────────
-            df_info = dataset_info(
-                local_path,
-                dataset.period_division,
-                dataset.period_names,
-                dataset.np_,
-                dataset.t_threshold,
-                dataset.bounding_box,
-            )
-            print(f"  Loaded {len(df_info.df):,} rows. Preprocessing …")
-            df_info.preprocess()
+            else:
+                df_info = dataset_info(
+                    local_path,
+                    dataset.period_division,
+                    dataset.period_names,
+                    dataset.np_,
+                    dataset.t_threshold,
+                    dataset.bounding_box,
+                )
+                print(f"  Loaded {len(df_info.df):,} rows. Preprocessing …")
+                df_info.preprocess()
         except Exception as exc:
             print(f"  WARNING: preprocessing error — skipping shard.\n  {exc}")
             local_path.unlink(missing_ok=True)
             continue
+
+        # ── Consolidate / upload — runs for BOTH vectorized and legacy paths,
+        #    OUTSIDE the preprocessing try/except so upload errors do not
+        #    masquerade as preprocessing failures.
+        if use_vectorized:
+            print(f"  Consolidating store …")
+            _label = _shard_label(shard_key)
+            _out_ep = output_endpoint_url or endpoint_url
+            for period in dataset.period_names:
+                try:
+                    if output_bucket and output_s3_prefix:
+                        store.upload_shard_to_s3_unique(
+                            period, _label,
+                            output_bucket, output_s3_prefix, _out_ep,
+                            delete_after=delete_local_after_upload,
+                        )
+                    else:
+                        store.consolidate_all(period)
+                except Exception as _upload_exc:
+                    print(
+                        f"  WARNING: upload/consolidation failed for period {period!r}"
+                        f" — local results preserved, shard marked done.\n  {_upload_exc}"
+                    )
+            print(
+                f"  Cumulative users: "
+                + "  ".join(
+                    f"{p!r}: {dataset.period2totalusers[p]:,}"
+                    for p in dataset.period_names
+                )
+            )
+            continue  # → next shard (skip legacy block below)
 
         # 3c. Compute metrics per period — per-period try/except so one
         #     failing period does NOT skip the remaining periods in the shard.
@@ -933,7 +793,6 @@ def analyze_from_s3_progressive(
                     df_info,
                     store=store,
                     batch_size=batch_size,
-                    n_workers=n_workers,
                     use_vectorized=use_vectorized,
                 )
             except Exception as exc:
@@ -962,11 +821,26 @@ def analyze_from_s3_progressive(
             with open(checkpoint_path, "w") as _f:
                 json.dump({"completed": sorted(completed_shards)}, _f, indent=2)
 
-        # 3f. Periodic consolidation
-        if (shard_idx + 1) % consolidate_every == 0:
+        # 3f. Consolidate and optionally upload output to S3, freeing local disk
+        if not shard_had_error:
             print(f"  Consolidating store …")
+            _label = _shard_label(shard_key)
+            _out_ep = output_endpoint_url or endpoint_url
             for period in dataset.period_names:
-                store.consolidate_all(period)
+                try:
+                    if output_bucket and output_s3_prefix:
+                        store.upload_shard_to_s3_unique(
+                            period, _label,
+                            output_bucket, output_s3_prefix, _out_ep,
+                            delete_after=delete_local_after_upload,
+                        )
+                    else:
+                        store.consolidate_all(period)
+                except Exception as _upload_exc:
+                    print(
+                        f"  WARNING: upload/consolidation failed for period {period!r}"
+                        f" — local results preserved, shard marked done.\n  {_upload_exc}"
+                    )
 
         print(
             f"  Cumulative users: "
@@ -976,9 +850,21 @@ def analyze_from_s3_progressive(
             )
         )
 
-    # ── 4. Final consolidation ───────────────────────────────────────────────
-    print("\nFinal store consolidation …")
-    for period in dataset.period_names:
-        store.consolidate_all(period)
+    # ── 4. Final step ────────────────────────────────────────────────────────
+    if output_bucket and output_s3_prefix:
+        _out_ep = output_endpoint_url or endpoint_url
+        print(
+            "\nAll shards processed.  Merging per-shard S3 files into"
+            " final consolidated.parquet …"
+        )
+        for period in dataset.period_names:
+            store.consolidate_s3_shards(
+                period, output_bucket, output_s3_prefix, _out_ep,
+                delete_shards_after=True,
+            )
+    else:
+        print("\nFinal store consolidation …")
+        for period in dataset.period_names:
+            store.consolidate_all(period)
     print("Done.")
 

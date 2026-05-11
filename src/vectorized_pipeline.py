@@ -57,6 +57,7 @@ The following metrics differ slightly from the old skmob-based ones:
 from __future__ import annotations
 
 import math
+import time
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -85,7 +86,13 @@ if TYPE_CHECKING:
     from .store import ParquetStore
     from .datasets import _BaseDataset
 
-from concurrent.futures import ProcessPoolExecutor
+from .utils import get_cpu_quota as _get_cpu_quota
+
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:
+    def _tqdm(it, **kw):  # type: ignore[misc]
+        return it
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -94,6 +101,10 @@ from concurrent.futures import ProcessPoolExecutor
 _PI = math.pi
 _R_KM = 6371.0        # WGS-84 mean radius in km
 _T_MAX = TIME_INTERVAL_S_MAX  # 1420
+
+# Polars' thread pool is set at import time via the POLARS_NUM_THREADS env var.
+# main.py sets it to the cgroup CPU quota before importing this module.
+_real_cores = _get_cpu_quota()
 
 # ---------------------------------------------------------------------------
 # Section 1 — Pure-Python / NumPy per-user algorithms
@@ -551,6 +562,11 @@ def _gonz_worker(chunk_df: pl.DataFrame) -> dict:
     return _compute_gonzalez_polars(chunk_df)
 
 
+def _freq_worker(chunk_df: pl.DataFrame) -> dict:
+    """ProcessPoolExecutor worker: visit frequency for a user chunk."""
+    return _compute_frequency_polars(chunk_df)
+
+
 def _split_df_by_users(df: pl.DataFrame, n: int) -> list:
     """Split df into n roughly equal chunks by userId."""
     all_users = df["userId"].unique(maintain_order=False).to_list()
@@ -662,7 +678,8 @@ def _compute_st_polars(df: pl.DataFrame, t_threshold: int) -> dict[str, list]:
     """
     result: dict[str, list] = {}
 
-    for uid, grp in df.sort("begin").group_by("userId"):
+    _n_u = df["userId"].n_unique()
+    for uid, grp in _tqdm(df.sort("begin").group_by("userId"), total=_n_u, desc="S(t)", unit="user", leave=False):
         uid_str = str(uid)
         t0      = grp["begin"][0]
         t_hours = (grp["begin"] - t0).dt.total_hours().to_numpy().astype(np.int64)
@@ -680,7 +697,8 @@ def _compute_gonzalez_polars(df: pl.DataFrame) -> dict:
     ``store.write_gonzalez_batch()``.
     """
     batch: dict = {}
-    for uid, grp in df.group_by("userId"):
+    _n_u = df["userId"].n_unique()
+    for uid, grp in _tqdm(df.group_by("userId"), total=_n_u, desc="gonzalez", unit="user", leave=False):
         uid_str = str(uid)
         lat_arr = grp["lat"].to_numpy()
         lon_arr = grp["lon"].to_numpy()
@@ -715,7 +733,8 @@ def _compute_frequency_polars(df: pl.DataFrame) -> dict:
     )
 
     batch: dict = {}
-    for uid, grp in loc_counts.group_by("userId"):
+    _n_u = loc_counts["userId"].n_unique()
+    for uid, grp in _tqdm(loc_counts.group_by("userId"), total=_n_u, desc="frequency", unit="user", leave=False):
         uid_str = str(uid)
         n = len(grp)
         gh7  = grp["geohash7"].to_list()
@@ -739,8 +758,16 @@ def _compute_weekly_rg_polars(
     Weekly radius of gyration for all users.
 
     Returns ``(batch, all_weeks)`` where:
-    * ``batch`` is ``{uid_str: {week_key: rg_value}}``
+    * ``batch`` is ``{uid_str: {week_label: rg_value}}``
     * ``all_weeks`` is the ordered list of week-start datetimes as strings
+
+    Implementation: outer loop over weeks (≤ 19), inner computation uses
+    ``_compute_radius_of_gyration_polars`` on ALL users at once via Polars'
+    own Rust thread pool.  This replaces the old O(n_users × n_weeks) Python
+    nested-loop that was the primary serial bottleneck for the long periods.
+
+    Keys in each user's dict match the string entries in ``all_weeks`` so
+    that ``write_weekly_rg_batch`` can look them up correctly.
     """
     from datetime import timedelta as _td
 
@@ -761,36 +788,37 @@ def _compute_weekly_rg_polars(
     if len(weeks) < 2:
         return batch, all_weeks
 
-    for uid, grp in df.group_by("userId"):
-        uid_str  = str(uid)
-        week2rg: dict = {}
-        for wi in range(len(weeks) - 1):
-            w_start = weeks[wi]
-            w_end   = weeks[wi + 1]
-            week_df = grp.filter(
-                (pl.col("begin") > pl.lit(w_start))
-                & (pl.col("begin") < pl.lit(w_end))
-            )
-            if len(week_df) <= 3:
-                week2rg[wi] = float("nan")
-                continue
-            total_dur = week_df["dur_min"].sum()
-            if total_dur == 0:
-                week2rg[wi] = float("nan")
-                continue
-            cm_lat = (week_df["lat"] * week_df["dur_min"]).sum() / total_dur
-            cm_lon = (week_df["lon"] * week_df["dur_min"]).sum() / total_dur
-            lat_arr = week_df["lat"].to_numpy()
-            lon_arr = week_df["lon"].to_numpy()
-            dur_arr = week_df["dur_min"].to_numpy()
-            c_lat = 0.6e5 * (1.85533 - 0.006222 * math.sin(cm_lat * _PI / 180))
-            c_lon = c_lat * math.cos(cm_lat * _PI / 180)
-            dx = c_lon * (lon_arr - cm_lon)
-            dy = c_lat * (lat_arr - cm_lat)
-            d2 = dx ** 2 + dy ** 2
-            rg_m = math.sqrt((dur_arr * d2).sum() / total_dur)
-            week2rg[wi] = rg_m / 1000.0  # → km
-        batch[uid_str] = week2rg
+    # Outer loop is over weeks (≤ 19); the expensive per-user RG computation
+    # runs fully in Polars' thread pool for ALL users in each week at once.
+    for wi in _tqdm(range(len(weeks) - 1), desc="weekly_rg", unit="week", leave=False):
+        w_label = all_weeks[wi]          # string key, matches write_weekly_rg_batch lookup
+        w_start = weeks[wi]
+        w_end   = weeks[wi + 1]
+
+        week_df = df.filter(
+            (pl.col("begin") > pl.lit(w_start))
+            & (pl.col("begin") < pl.lit(w_end))
+        )
+        if week_df.is_empty():
+            continue
+
+        # Drop users with ≤ 3 stops in this week (same threshold as old code)
+        n_stops = week_df.group_by("userId").agg(pl.len().alias("n_stops"))
+        valid_users = n_stops.filter(pl.col("n_stops") > 3)["userId"]
+        week_df = week_df.filter(pl.col("userId").is_in(valid_users))
+        if week_df.is_empty():
+            continue
+
+        # Vectorized RG for all valid users — uses Polars thread pool
+        rg_df = _compute_radius_of_gyration_polars(week_df)  # [userId, radius_gyration]
+
+        for uid_str, rg_val in zip(
+            rg_df["userId"].cast(pl.Utf8).to_list(),
+            rg_df["radius_gyration"].to_list(),
+        ):
+            if uid_str not in batch:
+                batch[uid_str] = {}
+            batch[uid_str][w_label] = rg_val
 
     return batch, all_weeks
 
@@ -873,7 +901,6 @@ def compute_all_polars(
     already_done_wrg: set,
     store: "ParquetStore",
     batch_size: int = 5000,
-    n_workers: int = 1,
 ) -> dict:
     """
     Vectorized replacement for ``compute_all()`` in pipeline.py.
@@ -899,15 +926,6 @@ def compute_all_polars(
         Output store.
     batch_size : int
         Maximum users per parquet shard write.  Larger = fewer shards.
-    n_workers : int
-        Number of parallel worker processes for the Python-heavy metrics
-        (real_entropy, S(t), Gonzalez) that use ``map_groups`` with a
-        Python callback and are therefore GIL-bound when run serially.
-        Polars expression-based metrics (group_by + agg) are always
-        parallel via polars' own thread pool regardless of this value.
-        ``1`` (default) runs everything in the main process.
-        Set to ``os.cpu_count()`` to saturate all available cores.
-
     Returns
     -------
     dict
@@ -932,19 +950,27 @@ def compute_all_polars(
     if pending_df.is_empty():
         return {}
 
-    print(f"  [vectorized] Period '{period}': {pending_df['userId'].n_unique():,} pending users")
+    n_pending = pending_df["userId"].n_unique()
+    print(f"  [vectorized] Period '{period}': {n_pending:,} pending users")
 
     # ------------------------------------------------------------------ #
     # SCALAR METRICS (single polars pass for most)                        #
     # ------------------------------------------------------------------ #
+    _t_scalars = time.perf_counter()
     scalars: pl.DataFrame | None = None
 
     if cfg.get("is_radius_gyration") and not cfg.get("already_computed_rg"):
+        _t_m = time.perf_counter()
+        print("  [compute] radius_of_gyration ...", end="", flush=True)
         rg = _compute_radius_of_gyration_polars(pending_df)
+        print(f" {time.perf_counter()-_t_m:.1f}s")
         scalars = rg if scalars is None else scalars.join(rg, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_random_entropy") and not cfg.get("already_computed_random_entropy"):
+        _t_m = time.perf_counter()
+        print("  [compute] random_entropy ...", end="", flush=True)
         ent = _compute_entropies_polars(pending_df)
+        print(f" {time.perf_counter()-_t_m:.1f}s")
         scalars = (
             ent.select(["userId", "random_entropy"])
             if scalars is None
@@ -953,7 +979,10 @@ def compute_all_polars(
 
     if cfg.get("is_uncorrelated_entropy") and not cfg.get("already_computed_uncorrelated_entropy"):
         if scalars is None or "uncorrelated_entropy" not in scalars.columns:
+            _t_m = time.perf_counter()
+            print("  [compute] uncorrelated_entropy ...", end="", flush=True)
             ent = _compute_entropies_polars(pending_df)
+            print(f" {time.perf_counter()-_t_m:.1f}s")
             scalars = (
                 ent.select(["userId", "uncorrelated_entropy"])
                 if scalars is None
@@ -961,36 +990,47 @@ def compute_all_polars(
             )
 
     if cfg.get("is_real_entropy") and not cfg.get("already_computed_real_entropy"):
-        if n_workers > 1:
-            chunks = _split_df_by_users(pending_df, n_workers)
-            with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                parts = list(pool.map(_re_worker, chunks))
-            re_df = pl.concat([p for p in parts if not p.is_empty()])
-        else:
-            re_df = _compute_real_entropy_polars(pending_df)
+        _t = time.perf_counter()
+        print("  [compute] real_entropy [LZ78] ...", end="", flush=True)
+        re_df = _compute_real_entropy_polars(pending_df)
+        print(f" {time.perf_counter()-_t:.1f}s")
         scalars = re_df if scalars is None else scalars.join(re_df, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_distance") and not cfg.get("already_computed_distance"):
+        _t_m = time.perf_counter()
+        print("  [compute] distance ...", end="", flush=True)
         dist = _compute_distance_polars(pending_df)
+        print(f" {time.perf_counter()-_t_m:.1f}s")
         scalars = dist if scalars is None else scalars.join(dist, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_fraction_time") and not cfg.get("already_computed_fraction_time"):
+        _t_m = time.perf_counter()
+        print("  [compute] fraction_time ...", end="", flush=True)
         q_df = _compute_fraction_time_polars(pending_df, period_start, period_end)
+        print(f" {time.perf_counter()-_t_m:.1f}s")
         scalars = q_df if scalars is None else scalars.join(q_df, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_home") and not cfg.get("already_computed_home"):
+        _t_m = time.perf_counter()
+        print("  [compute] home ...", end="", flush=True)
         home = _compute_home_polars(pending_df)
+        print(f" {time.perf_counter()-_t_m:.1f}s")
         scalars = home if scalars is None else scalars.join(home, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_krg") and not cfg.get("already_computed_krg"):
+        _t_m = time.perf_counter()
+        print("  [compute] k_radius_of_gyration ...", end="", flush=True)
         krg = _compute_krg_polars(pending_df, K_RADIUS_VALUES)
+        print(f" {time.perf_counter()-_t_m:.1f}s")
         scalars = krg if scalars is None else scalars.join(krg, on="userId", how="full", coalesce=True)
 
     if cfg.get("is_county_rural") and not cfg.get("already_computed_county_rural"):
         if scalars is not None and "home_lat" in scalars.columns:
+            _t = time.perf_counter()
             scalars = _assign_county_polars(
                 scalars, dataset.geojson, dataset.county2party, dataset.county2rural
             )
+            print(f"  [timing] county_assignment: {time.perf_counter()-_t:.1f}s")
 
     # -- Convert home coordinates to WKT Point string (for store compat) --
     if scalars is not None and "home_lat" in scalars.columns:
@@ -1006,6 +1046,8 @@ def compute_all_polars(
             pl.Series("home", home_str, dtype=pl.Utf8)
         )
         # home_geohash7 already in scalars from _compute_home_polars
+
+    print(f"  [timing] scalar metrics: {time.perf_counter()-_t_scalars:.1f}s total")
 
     # -- Build scalar batch and write to store in chunks -------------------
     if scalars is not None:
@@ -1035,15 +1077,10 @@ def compute_all_polars(
             ~pl.col("userId").cast(pl.Utf8).is_in(already_done_gonzalez)
         )
         if not pending_gonz.is_empty():
-            if n_workers > 1:
-                chunks = _split_df_by_users(pending_gonz, n_workers)
-                with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                    parts = list(pool.map(_gonz_worker, chunks))
-                gonz_batch: dict = {}
-                for d in parts:
-                    gonz_batch.update(d)
-            else:
-                gonz_batch = _compute_gonzalez_polars(pending_gonz)
+            _t = time.perf_counter()
+            print("  [compute] gonzalez ...", end="", flush=True)
+            gonz_batch: dict = _compute_gonzalez_polars(pending_gonz)
+            print(f" {time.perf_counter()-_t:.1f}s")
             uids = list(gonz_batch.keys())
             for chunk_start in range(0, len(uids), batch_size):
                 chunk = {u: gonz_batch[u] for u in uids[chunk_start:chunk_start + batch_size]}
@@ -1057,15 +1094,10 @@ def compute_all_polars(
             ~pl.col("userId").cast(pl.Utf8).is_in(already_done_st)
         )
         if not pending_st.is_empty():
-            if n_workers > 1:
-                chunks = _split_df_by_users(pending_st, n_workers)
-                with ProcessPoolExecutor(max_workers=n_workers) as pool:
-                    parts = list(pool.map(_st_worker, [(c, t_threshold) for c in chunks]))
-                st_batch: dict = {}
-                for d in parts:
-                    st_batch.update(d)
-            else:
-                st_batch = _compute_st_polars(pending_st, t_threshold)
+            _t = time.perf_counter()
+            print("  [compute] S(t) ...", end="", flush=True)
+            st_batch: dict = _compute_st_polars(pending_st, t_threshold)
+            print(f" {time.perf_counter()-_t:.1f}s")
             uids = list(st_batch.keys())
             for chunk_start in range(0, len(uids), batch_size):
                 chunk = {u: st_batch[u] for u in uids[chunk_start:chunk_start + batch_size]}
@@ -1079,7 +1111,10 @@ def compute_all_polars(
             ~pl.col("userId").cast(pl.Utf8).is_in(already_done_freq)
         )
         if not pending_freq.is_empty():
-            freq_batch = _compute_frequency_polars(pending_freq)
+            _t = time.perf_counter()
+            print("  [compute] frequency ...", end="", flush=True)
+            freq_batch: dict = _compute_frequency_polars(pending_freq)
+            print(f" {time.perf_counter()-_t:.1f}s")
             uids = list(freq_batch.keys())
             for chunk_start in range(0, len(uids), batch_size):
                 chunk = {u: freq_batch[u] for u in uids[chunk_start:chunk_start + batch_size]}
@@ -1093,12 +1128,14 @@ def compute_all_polars(
             ~pl.col("userId").cast(pl.Utf8).is_in(already_done_wrg)
         )
         if not pending_wrg.is_empty():
+            _t = time.perf_counter()
             wrg_batch, all_weeks = _compute_weekly_rg_polars(
                 pending_wrg,
                 dataset.period_division,
                 period,
                 dataset.perodname2idx,
             )
+            print(f"  [timing] weekly_rg: {time.perf_counter()-_t:.1f}s (vectorized, Polars)")
             uids = list(wrg_batch.keys())
             for chunk_start in range(0, len(uids), batch_size):
                 chunk = {u: wrg_batch[u] for u in uids[chunk_start:chunk_start + batch_size]}

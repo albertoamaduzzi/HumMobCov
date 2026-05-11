@@ -68,8 +68,8 @@ DIR_SHARD_TEMP = Path(
 # ---------------------------------------------------------------------------
 # All computed results (parquet store, transition matrices, …) are
 # synchronised here after local computation.  The folder name
-# ``final_pipeline`` is intentionally distinct from all previous pipeline
-# versions so it is easy to identify.
+# ``final_pipeline`` sits at the root of the bucket so it is easy to
+# identify and separate from raw input data.
 #
 # Override via environment variables to change bucket / prefix:
 #   S3_OUTPUT_BUCKET     (defaults to S3_BUCKET)
@@ -81,11 +81,11 @@ S3_OUTPUT_BUCKET: str = _os.environ.get("S3_OUTPUT_BUCKET", "chub-datalake")
 S3_OUTPUT_PREFIX: dict[str, str] = {
     "CA": _os.environ.get(
         "S3_OUTPUT_PREFIX_CA",
-        "shared/cuebiq/MOBS/final_pipeline/CA",
+        "final_pipeline/CA",
     ),
     "MA": _os.environ.get(
         "S3_OUTPUT_PREFIX_MA",
-        "shared/cuebiq/MOBS/final_pipeline/MA",
+        "final_pipeline/MA",
     ),
 }
 

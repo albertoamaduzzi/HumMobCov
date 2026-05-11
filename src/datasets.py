@@ -84,12 +84,20 @@ class _BaseDataset:
         path = CENSUS_FILES[self.id_]["urban_info"]
         sep  = "," if self.id_ == "CA" else ";"
         df   = pd.read_csv(str(path), sep=sep, index_col=False)
-        self.county2rural  = {df.iloc[i]["name"]: df.iloc[i]["type_marta"] for i in range(len(df))}
+        # Column names differ by region: CA uses 'name'/'type_marta', MA uses 'NAMELSAD'/'RURALITY'
+        if "name" in df.columns:
+            col_name, col_type = "name", "type_marta"
+        else:
+            col_name, col_type = "NAMELSAD", "RURALITY"
+        self.county2rural  = {df.iloc[i][col_name]: df.iloc[i][col_type] for i in range(len(df))}
         self.df_rurality   = df
 
     def _init_county2party(self) -> dict:
         """Build ``{county_name: party}`` from the political CSV."""
         path = CENSUS_FILES[self.id_]["party_county"]
+        if not Path(str(path)).exists():
+            self.df_party = pd.DataFrame()
+            return {}
         df   = pd.read_csv(str(path), sep=";", index_col=False)
         self.df_party = df
         return {

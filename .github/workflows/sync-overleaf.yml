@@ -1,0 +1,154 @@
+# Sync .github/paper/ → Overleaf (one-way, GitHub is the single source of truth)
+#
+# Required repository secrets:
+#   OVERLEAF_USERNAME  – your Overleaf account e-mail address
+#   OVERLEAF_TOKEN     – your Overleaf account password (or a git token if
+#                        your account uses SSO; see README for instructions)
+#
+# Overleaf project: https://www.overleaf.com/project/63aaac5d854f4a2fb2ce1c2b
+
+name: Sync paper to Overleaf
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/paper/**'
+  schedule:
+    # Daily backup at 06:00 UTC even when there are no paper commits
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >
+          Dry run — show what would change without actually pushing to Overleaf
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  sync:
+    name: Push paper sources to Overleaf
+    runs-on: ubuntu-latest
+    permissions:
+      # Needed to open a GitHub issue on sync failure
+      issues: write
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Configure Git identity and credentials ─────────────────────────
+      - name: Configure Git identity and credentials
+        env:
+          OVERLEAF_USERNAME: ${{ secrets.OVERLEAF_USERNAME }}
+          OVERLEAF_TOKEN:    ${{ secrets.OVERLEAF_TOKEN }}
+        run: |
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name  "github-actions[bot]"
+          # Store credentials via the Git credential helper so they are never
+          # embedded directly in remote URLs (avoids exposure in process listings
+          # and git remote -v output).
+          git config --global credential.helper store
+          printf 'https://%s:%s@git.overleaf.com\n' \
+            "$OVERLEAF_USERNAME" "$OVERLEAF_TOKEN" \
+            > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+
+      # ── 3. Clone Overleaf project ──────────────────────────────────────────
+      - name: Clone Overleaf project
+        run: |
+          git clone https://git.overleaf.com/63aaac5d854f4a2fb2ce1c2b /tmp/overleaf
+
+      # ── 4. Replace Overleaf content with GitHub paper sources ──────────────
+      - name: Replace content
+        run: |
+          cd /tmp/overleaf
+          # Remove every tracked file so the commit is a clean replacement
+          git rm -rf --quiet . || true
+          # Copy everything from .github/paper/ into the Overleaf clone root
+          cp -rT "$GITHUB_WORKSPACE/.github/paper" /tmp/overleaf
+
+      # ── 5. Stage and detect changes ───────────────────────────────────────
+      - name: Detect changes
+        id: diff
+        run: |
+          cd /tmp/overleaf
+          git add -A
+          if git diff --cached --quiet; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            echo "No changes – Overleaf is already up to date."
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 6. Always show a diff summary in the run log ──────────────────────
+      - name: Diff summary
+        run: |
+          cd /tmp/overleaf
+          git diff --cached --stat || echo "(no staged changes)"
+
+      # ── 7. Commit ─────────────────────────────────────────────────────────
+      - name: Commit
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          cd /tmp/overleaf
+          TIMESTAMP=$(date -u '+%Y-%m-%d %H:%M UTC')
+          git commit -m "Sync from GitHub ${TIMESTAMP} @ ${{ github.sha }}"
+
+      # ── 8. Push (skipped during dry-run) ──────────────────────────────────
+      - name: Push to Overleaf
+        if: >
+          steps.diff.outputs.has_changes == 'true' &&
+          github.event.inputs.dry_run != 'true'
+        run: |
+          cd /tmp/overleaf
+          git push origin master
+
+      # ── 9. Dry-run notice ─────────────────────────────────────────────────
+      - name: Dry-run notice
+        if: github.event.inputs.dry_run == 'true'
+        run: echo "DRY RUN — push skipped. Review the diff summary above."
+
+      # ── 10. Open a GitHub issue on failure ────────────────────────────────
+      - name: Create issue on failure
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const today  = new Date().toISOString().slice(0, 10);
+
+            // Create label if it doesn't exist yet
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo:  context.repo.repo,
+                name:  'overleaf-sync',
+                color: '0075ca',
+                description: 'Overleaf synchronisation failure',
+              });
+            } catch (_) { /* label already exists – ignore */ }
+
+            await github.rest.issues.create({
+              owner:  context.repo.owner,
+              repo:   context.repo.repo,
+              title:  `[Overleaf sync] Workflow failed — ${today}`,
+              labels: ['overleaf-sync'],
+              body: [
+                '## ⚠️ Overleaf sync failure',
+                '',
+                `The \`sync-overleaf\` workflow failed on run [#${context.runId}](${runUrl}).`,
+                '',
+                '**Possible causes**',
+                '- `OVERLEAF_USERNAME` or `OVERLEAF_TOKEN` secret is missing or expired.',
+                '- Overleaf rejected the push due to a conflict with manual edits made directly on Overleaf.',
+                '',
+                '**Recovery steps**',
+                '1. Open the run log and identify the failing step.',
+                '2. **If credentials expired**: update the `OVERLEAF_TOKEN` secret in *Settings → Secrets → Actions* and re-run.',
+                '3. **If there is a conflict**: see the *Recovery from Overleaf conflicts* section in the README.',
+                '4. Re-run the workflow once the issue is resolved.',
+              ].join('\n'),
+            });

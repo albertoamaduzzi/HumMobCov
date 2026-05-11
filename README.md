@@ -167,3 +167,67 @@ Each boolean flag enables or disables a computation step:
 - **Census / boundary data**: U.S. Census Bureau TIGER shapefiles (`census_data/`).
 - **Political affiliation**: County-level presidential vote share (`political_government_per_county.csv`).
 - **Rurality**: Urban/rural classification derived from population density (`urban_info_threshold_urbanity_500.csv`).
+
+---
+
+## Overleaf synchronization
+
+The manuscript lives in `.github/paper/` and is automatically pushed to the
+shared [Overleaf project](https://www.overleaf.com/project/63aaac5d854f4a2fb2ce1c2b)
+by the workflow at `.github/workflows/sync-overleaf.yml`.
+
+### Source-of-truth rule
+
+> **GitHub is the single source of truth.**  
+> Always edit `.github/paper/` in this repository.  
+> Do **not** edit files directly on Overleaf — those changes will be
+> overwritten the next time the workflow runs.
+
+### How the sync works
+
+| Trigger | What happens |
+|---|---|
+| Push to `main` touching `.github/paper/**` | Files are pushed to Overleaf immediately |
+| Daily at 06:00 UTC (schedule) | Baseline sync even with no new commits |
+| Manual (`workflow_dispatch`) | Run any time; tick *Dry run* to preview without pushing |
+
+The workflow clones the Overleaf project, replaces every file with the
+contents of `.github/paper/`, commits with a timestamp, and pushes.
+If nothing changed, the push is skipped.
+
+### One-time setup — repository secrets
+
+Go to **Settings → Secrets and variables → Actions** in this repository and
+add the two secrets below.
+
+| Secret name | Value |
+|---|---|
+| `OVERLEAF_USERNAME` | Your Overleaf account e-mail address |
+| `OVERLEAF_TOKEN` | Your Overleaf account password. If your account uses Google / SSO sign-in, first set an Overleaf password via *Account → Password*. |
+
+> **Tip:** Overleaf uses standard HTTP Basic Auth over HTTPS — there is no
+> separate API token; your account password is the credential.
+
+### Recovery from Overleaf conflicts
+
+If someone has edited files directly on Overleaf and the push is rejected:
+
+1. **Discard Overleaf changes** (recommended — GitHub is the source of truth):
+   ```bash
+   # Clone the Overleaf project locally
+   git clone https://YOUR_EMAIL:YOUR_PASSWORD@git.overleaf.com/63aaac5d854f4a2fb2ce1c2b overleaf-local
+   cd overleaf-local
+   # Hard-reset to the last GitHub-synced commit, then force-push
+   git fetch origin
+   git reset --hard origin/master
+   git push --force origin master
+   ```
+   Then re-run the GitHub Actions workflow.
+
+2. **Preserve Overleaf changes** (manual merge):
+   ```bash
+   git clone https://YOUR_EMAIL:YOUR_PASSWORD@git.overleaf.com/63aaac5d854f4a2fb2ce1c2b overleaf-local
+   cd overleaf-local
+   # Identify changes, copy them into .github/paper/ in this repo, commit and push
+   ```
+   The next workflow run will then push the merged result back to Overleaf.

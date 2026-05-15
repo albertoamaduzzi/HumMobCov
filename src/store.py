@@ -202,6 +202,59 @@ class ParquetStore:
                 continue
         return users
 
+    def get_s3_computed_users(
+        self,
+        period: str,
+        kind: str,
+        s3_bucket: str,
+        s3_prefix: str,
+        endpoint_url: str,
+    ) -> set[str]:
+        """
+        Return user IDs already stored for (period, kind) on S3.
+
+        Downloads the consolidated parquet to a temporary file, reads user
+        identifiers from its metadata (fixed-length kinds) or ``user_id``
+        column (long-format kinds), then deletes the temp file.
+
+        Returns an empty set if the S3 object does not exist or the download
+        fails.
+        """
+        from .s3_io import s3_read_parquet, s3_read_parquet_schema
+
+        shard_dir_name = self._shard_dir(period, kind).name
+        s3_key = f"{s3_prefix}/{shard_dir_name}/{CONSOLIDATED_FNAME}"
+
+        users: set[str] = set()
+        try:
+            if kind in FIXED_LENGTH_KINDS:
+                index_col = _INDEX_COL.get(kind)
+                schema = s3_read_parquet_schema(s3_bucket, s3_key, endpoint_url)
+                if schema is not None:
+                    users.update(n for n in schema if n != index_col)
+            else:
+                df = s3_read_parquet(s3_bucket, s3_key, endpoint_url)
+                if df is not None:
+                    users.update(
+                        df.select("user_id")["user_id"].cast(pl.Utf8).to_list()
+                    )
+        except Exception:
+            pass
+        return users
+
+    def get_s3_computed_users_long(
+        self,
+        period: str,
+        kind: str,
+        s3_bucket: str,
+        s3_prefix: str,
+        endpoint_url: str,
+    ) -> set[str]:
+        """Alias kept for symmetry; delegates to ``get_s3_computed_users``."""
+        return self.get_s3_computed_users(
+            period, kind, s3_bucket, s3_prefix, endpoint_url
+        )
+
     # ------------------------------------------------------------------
     # Writing
     # ------------------------------------------------------------------
@@ -1008,6 +1061,147 @@ class ParquetStore:
     # S3 synchronisation
     # ------------------------------------------------------------------
 
+    def pull_period_from_s3(
+        self,
+        period: str,
+        kind: str,
+        s3_bucket: str,
+        s3_prefix: str,
+        endpoint_url: str,
+        verbose: bool = True,
+    ) -> bool:
+        """
+        Ensure (period, kind) data is available locally.
+
+        Strategy (in order):
+        1. ``consolidated.parquet`` exists on S3 → download it directly.
+        2. Per-shard files exist under ``shards/`` on S3 → download,
+           merge in memory, write ``consolidated.parquet`` locally.
+        3. Nothing on S3 → return False.
+
+        Unlike ``consolidate_s3_shards`` this method **never re-uploads**
+        anything; it is read-only with respect to S3.
+
+        Returns
+        -------
+        bool
+            True if the local store now has data for (period, kind).
+        """
+        from .s3_io import s3_exists, s3_download, s3_list, s3_read_parquet
+
+        shard_dir_name = self._shard_dir(period, kind).name
+        s3_consolidated_key = f"{s3_prefix}/{shard_dir_name}/{CONSOLIDATED_FNAME}"
+        local_cp = self._consolidated_path(period, kind)
+
+        # ── Try consolidated.parquet first ──────────────────────────────────
+        if s3_exists(s3_bucket, s3_consolidated_key, endpoint_url):
+            if verbose:
+                print(
+                    f"  [S3 pull] {kind} {period!r}: downloading"
+                    f" consolidated.parquet …",
+                    end=" ",
+                )
+            ok = s3_download(s3_bucket, s3_consolidated_key, local_cp, endpoint_url)
+            if verbose:
+                print("OK" if ok else "FAILED")
+            return ok
+
+        # ── Fall back: merge per-shard files ────────────────────────────────
+        s3_shards_prefix = f"{s3_prefix}/{shard_dir_name}/shards"
+        s3_keys = s3_list(s3_bucket, s3_shards_prefix, endpoint_url, suffix=".parquet")
+        if not s3_keys:
+            if verbose:
+                print(
+                    f"  [S3 pull] {kind} {period!r}: not found on S3."
+                )
+            return False
+
+        if verbose:
+            print(
+                f"  [S3 pull] {kind} {period!r}: merging"
+                f" {len(s3_keys)} shard(s) …",
+                end=" ",
+            )
+
+        frames: list[pl.DataFrame] = []
+        for s3_key in s3_keys:
+            df = s3_read_parquet(s3_bucket, s3_key, endpoint_url)
+            if df is not None:
+                frames.append(df)
+
+        if not frames:
+            if verbose:
+                print("FAILED (no readable shards)")
+            return False
+
+        index_col = _INDEX_COL.get(kind)
+        if kind in FIXED_LENGTH_KINDS:
+            merged = _hconcat_fixed(frames, index_col)
+        else:
+            merged = pl.concat(frames, how="diagonal_relaxed")
+
+        merged.write_parquet(local_cp, compression="snappy")
+        if verbose:
+            print("OK")
+        return True
+
+    def pull_all_from_s3(
+        self,
+        period_names: list[str],
+        s3_bucket: str,
+        s3_prefix: str,
+        endpoint_url: str,
+        kinds: list[str] | None = None,
+        verbose: bool = True,
+    ) -> dict[str, dict[str, bool]]:
+        """
+        Pull all missing (period, kind) data from S3 to the local store.
+
+        Only downloads kinds that are **not already present locally**,
+        so it is safe to call repeatedly.
+
+        Parameters
+        ----------
+        period_names : list[str]
+            Periods to check (typically ``dataset.period_names``).
+        kinds : list[str] or None
+            Subset of metric kinds to check.  Defaults to all kinds.
+
+        Returns
+        -------
+        dict[str, dict[str, bool]]
+            ``{period: {kind: pulled}}`` mapping where ``pulled`` is True
+            if the data is now available locally (either pre-existing or
+            just downloaded).
+        """
+        if kinds is None:
+            kinds = list(FIXED_LENGTH_KINDS) + list(LONG_FORMAT_KINDS)
+
+        results: dict[str, dict[str, bool]] = {}
+        for period in period_names:
+            results[period] = {}
+            for kind in kinds:
+                # Check local first
+                if kind in FIXED_LENGTH_KINDS:
+                    already = bool(self.get_computed_users(period, kind))
+                else:
+                    already = bool(self.get_computed_users_long(period, kind))
+
+                if already:
+                    if verbose:
+                        print(f"  [{period}] {kind}: already local — skip")
+                    results[period][kind] = True
+                    continue
+
+                # Pull from S3
+                ok = self.pull_period_from_s3(
+                    period, kind, s3_bucket, s3_prefix, endpoint_url,
+                    verbose=verbose,
+                )
+                results[period][kind] = ok
+
+        return results
+
     def upload_shard_to_s3_unique(
         self,
         period: str,
@@ -1115,7 +1309,7 @@ class ParquetStore:
         dict[str, bool]
             ``{kind: success}`` mapping.
         """
-        import subprocess as _sp
+        from .s3_io import s3_list, s3_read_parquet, s3_delete
         import tempfile as _tf
 
         results: dict[str, bool] = {}
@@ -1126,28 +1320,15 @@ class ParquetStore:
             s3_consolidated_key = f"{s3_prefix}/{shard_dir_name}/{CONSOLIDATED_FNAME}"
 
             # List per-shard files on S3
-            ls = _sp.run(
-                [
-                    "aws", "s3", "ls",
-                    f"s3://{s3_bucket}/{s3_shards_prefix}/",
-                    "--endpoint-url", endpoint_url,
-                ],
-                capture_output=True, text=True,
+            s3_keys = s3_list(
+                s3_bucket, s3_shards_prefix, endpoint_url, suffix=".parquet"
             )
-            if ls.returncode != 0 or not ls.stdout.strip():
+            if not s3_keys:
                 if verbose:
                     print(
                         f"  [S3 consolidate] No per-shard files on S3 for"
                         f" {kind} {period!r} — skipping."
                     )
-                continue
-
-            s3_keys = [
-                f"{s3_shards_prefix}/{line.split()[-1]}"
-                for line in ls.stdout.splitlines()
-                if line.strip() and line.split()[-1].endswith(".parquet")
-            ]
-            if not s3_keys:
                 continue
 
             if verbose:
@@ -1156,57 +1337,37 @@ class ParquetStore:
                     f" {len(s3_keys)} shards → merging …"
                 )
 
-            # Download each shard into a temp directory and merge
-            with _tf.TemporaryDirectory(dir=self.base_dir) as tmpdir:
-                frames: list[pl.DataFrame] = []
-                downloaded_keys: list[str] = []
+            # Download each shard in-memory and merge
+            frames: list[pl.DataFrame] = []
+            downloaded_keys: list[str] = []
 
-                for s3_key in s3_keys:
-                    fname = Path(s3_key).name
-                    tmp_path = Path(tmpdir) / fname
-                    dl = _sp.run(
-                        [
-                            "aws", "s3", "cp",
-                            f"s3://{s3_bucket}/{s3_key}", str(tmp_path),
-                            "--endpoint-url", endpoint_url,
-                        ],
-                        capture_output=True, text=True,
-                    )
-                    if dl.returncode != 0:
-                        if verbose:
-                            print(
-                                f"    WARNING: download failed for {s3_key}"
-                                f"\n    {dl.stderr.strip()}"
-                            )
-                        continue
-                    try:
-                        frames.append(pl.read_parquet(tmp_path))
-                        downloaded_keys.append(s3_key)
-                    except Exception as e:
-                        if verbose:
-                            print(f"    WARNING: read failed for {s3_key}: {e}")
-
-                if not frames:
-                    results[kind] = False
+            for s3_key in s3_keys:
+                df = s3_read_parquet(s3_bucket, s3_key, endpoint_url)
+                if df is None:
+                    if verbose:
+                        print(f"    WARNING: could not read {s3_key}")
                     continue
+                frames.append(df)
+                downloaded_keys.append(s3_key)
 
-                # Merge
-                index_col = _INDEX_COL.get(kind)
-                if kind in FIXED_LENGTH_KINDS:
-                    merged = _hconcat_fixed(frames, index_col)
-                else:
-                    merged = pl.concat(frames, how="diagonal_relaxed")
-                    # Drop rows that have null geohash (can appear when old
-                    # migration data with fewer columns is merged with new
-                    # vectorized-pipeline data via diagonal_relaxed).
-                    if kind == "frequency" and "geohash7" in merged.columns:
-                        merged = merged.filter(pl.col("geohash7").is_not_null())
-                    if kind == "gonzalez" and "x_norm" in merged.columns:
-                        merged = merged.filter(pl.col("x_norm").is_not_null())
+            if not frames:
+                results[kind] = False
+                continue
 
-                # Write merged result locally (in the normal shard dir)
-                cp = self._consolidated_path(period, kind)
-                merged.write_parquet(cp, compression="snappy")
+            # Merge
+            index_col = _INDEX_COL.get(kind)
+            if kind in FIXED_LENGTH_KINDS:
+                merged = _hconcat_fixed(frames, index_col)
+            else:
+                merged = pl.concat(frames, how="diagonal_relaxed")
+                if kind == "frequency" and "geohash7" in merged.columns:
+                    merged = merged.filter(pl.col("geohash7").is_not_null())
+                if kind == "gonzalez" and "x_norm" in merged.columns:
+                    merged = merged.filter(pl.col("x_norm").is_not_null())
+
+            # Write merged result locally (in the normal shard dir)
+            cp = self._consolidated_path(period, kind)
+            merged.write_parquet(cp, compression="snappy")
 
             # Upload consolidated.parquet to S3
             ok = self.upload_file_to_s3(
@@ -1221,14 +1382,7 @@ class ParquetStore:
             # Delete per-shard S3 files
             if delete_shards_after and ok:
                 for s3_key in downloaded_keys:
-                    _sp.run(
-                        [
-                            "aws", "s3", "rm",
-                            f"s3://{s3_bucket}/{s3_key}",
-                            "--endpoint-url", endpoint_url,
-                        ],
-                        capture_output=True, text=True,
-                    )
+                    s3_delete(s3_bucket, s3_key, endpoint_url)
 
         return results
 
@@ -1243,8 +1397,7 @@ class ParquetStore:
         """
         Upload a single local file to an S3-compatible store.
 
-        Uses the ``aws s3 cp`` CLI (same credentials / endpoint as the
-        download path in ``analyze_from_s3_progressive``).
+        Uses the ``boto3`` library — no AWS CLI required.
 
         Parameters
         ----------
@@ -1265,34 +1418,8 @@ class ParquetStore:
         bool
             True on success, False on failure (local file is kept on failure).
         """
-        import subprocess as _sp
-
-        if not local_path.exists():
-            print(f"  [S3 upload] File not found, skipping: {local_path}")
-            return False
-
-        s3_uri = f"s3://{s3_bucket}/{s3_key}"
-        result = _sp.run(
-            [
-                "aws", "s3", "cp",
-                str(local_path),
-                s3_uri,
-                "--endpoint-url", endpoint_url,
-            ],
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            print(
-                f"  [S3 upload] FAILED {local_path.name} → {s3_uri}\n"
-                f"  stderr: {result.stderr.strip()}"
-            )
-            return False
-
-        if delete_after:
-            local_path.unlink(missing_ok=True)
-        return True
+        from .s3_io import s3_upload
+        return s3_upload(local_path, s3_bucket, s3_key, endpoint_url, delete_after=delete_after)
 
     def upload_period_to_s3(
         self,
@@ -1421,42 +1548,24 @@ class ParquetStore:
         """
         List period names that already have consolidated data on S3.
 
-        Runs ``aws s3 ls`` to inspect the remote prefix and parses the
-        directory names back to period strings.
+        Uses the ``boto3`` library to list the S3 prefix.
 
         Returns
         -------
         list[str]
             Period names found on S3 (subset of ``PERIOD_NAMES``).
         """
-        import subprocess as _sp
+        from .s3_io import s3_list
         import re as _re
 
-        s3_uri = f"s3://{s3_bucket}/{s3_prefix}/"
-        result = _sp.run(
-            ["aws", "s3", "ls", s3_uri, "--endpoint-url", endpoint_url],
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            return []
-
+        keys = s3_list(s3_bucket, s3_prefix, endpoint_url)
+        period_pat = _re.compile(r"all_scalars_period_(.+?)_np_\d+_t_\d+")
         found: set[str] = set()
-        period_pat = _re.compile(
-            r"all_scalars_period_(.+?)_np_\d+_t_\d+/?$"
-        )
-        for line in result.stdout.splitlines():
-            parts = line.strip().split()
-            if not parts:
-                continue
-            name = parts[-1].rstrip("/")
-            m = period_pat.search(name)
+        for key in keys:
+            m = period_pat.search(key)
             if m:
-                # Reverse _safe_period encoding
                 period_safe = m.group(1)
-                period = period_safe.replace("_", " ")
-                found.add(period)
-
+                found.add(period_safe.replace("_", " "))
         return sorted(found)
 
 

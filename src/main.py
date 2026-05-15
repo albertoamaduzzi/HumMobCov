@@ -28,6 +28,7 @@ Sections
 """
 
 import argparse
+import gc
 import os as _os_pre
 import sys
 from pathlib import Path
@@ -72,8 +73,10 @@ from src import (
 from src.constants import (
     DIR_MILESTONES_SERVER,
     S3_ENDPOINT_URL, S3_BUCKET, S3_RAW_PREFIX, DIR_SHARD_TEMP,
-    S3_OUTPUT_BUCKET, S3_OUTPUT_PREFIX,
+    S3_OUTPUT_BUCKET, S3_OUTPUT_PREFIX, S3_TRANSITION_PREFIX,
 )
+from src.tile_counties_via_geohash import tile_counties_via_geohash
+from src.transition_matrices import TransitionPipeline
 import numpy as np
 import pandas as pd
 import matplotlib
@@ -128,7 +131,7 @@ def parse_args():
         help="Override temp directory for S3 shard downloads (default DIR_SHARD_TEMP).",
     )
     parser.add_argument(
-        "--batch-size", type=int, default=500,
+        "--batch-size", type=int, default=20000,
         help="Users per parquet shard write (S3 / local raw modes).",
     )
     parser.add_argument(
@@ -143,6 +146,36 @@ def parse_args():
     parser.add_argument(
         "--visualize", action="store_true",
         help="Run section 3 (visualisation) after the pipeline.",
+    )
+    parser.add_argument(
+        "--gap-analysis", action="store_true",
+        help="Run section 4 gap-analysis plots after the pipeline.",
+    )
+    parser.add_argument(
+        "--consolidate-s3", action="store_true",
+        help=(
+            "Run section 4 S3 consolidation: merge per-shard S3 files into "
+            "consolidated.parquet for every period (MODE B only)."
+        ),
+    )
+    parser.add_argument(
+        "--upload-to-s3", action="store_true",
+        help=(
+            "Run section 4 S3 upload: push local parquet results to S3 "
+            "(MODE A / MODE C)."
+        ),
+    )
+    parser.add_argument(
+        "--transition-matrices", action="store_true",
+        help="Run section 5 transition matrices pipeline.",
+    )
+    parser.add_argument(
+        "--geohash-precision", type=int, default=4,
+        help="Geohash precision for transition matrices (4 ≈ 39×20 km, 5 ≈ 5×5 km).",
+    )
+    parser.add_argument(
+        "--delta-time-h", type=float, default=1.0,
+        help="Time-bin width in hours for transition matrices.",
     )
     return parser.parse_args()
 
@@ -159,6 +192,9 @@ def section_input(args):
     print(f"Project root: {PROJECT_ROOT}")
     print(f"Output dir:   {DIR_OUTPUT}")
     print(f"Data dir:     {DIR_DATA}")
+    print(f"S3 endpoint:  {S3_ENDPOINT_URL}")
+    print(f"S3 bucket:    {S3_BUCKET}")
+    print(f"Out bucket:   {S3_OUTPUT_BUCKET}")
 
     # Initialise dataset
     if args.region == "CA":
@@ -285,11 +321,13 @@ def section_main(args, dataset, cfg):
         elif cfg.get("raw_trajectories"):
             print(
                 f"\nMODE B — S3 progressive download.\n"
-                f"  Endpoint : {s3_endpoint}\n"
-                f"  Bucket   : {s3_bucket}\n"
-                f"  Prefix   : {s3_prefix}\n"
-                f"  Temp dir : {temp_dir}\n"
-                f"  Periods to compute: {periods_todo}"
+                f"  Input endpoint  : {s3_endpoint}\n"
+                f"  Input bucket    : {s3_bucket}\n"
+                f"  Input prefix    : {s3_prefix}\n"
+                f"  Temp dir        : {temp_dir}\n"
+                f"  Output bucket   : {S3_OUTPUT_BUCKET}\n"
+                f"  Output prefix   : {S3_OUTPUT_PREFIX[args.region]}\n"
+                f"  Periods         : {periods_todo}"
             )
             analyze_from_s3_progressive(
                 dataset,
@@ -322,7 +360,7 @@ def section_main(args, dataset, cfg):
                     period_names = periods_todo,
                     np_          = dataset.np_,
                     t            = dataset.t_threshold,
-                    batch_size   = 5000,
+                    batch_size   = args.batch_size,
                     consolidate  = True,
                 )
                 print("Uploading results to S3…")
@@ -354,7 +392,7 @@ def section_main(args, dataset, cfg):
                 period_names   = periods_todo,
                 np_            = dataset.np_,
                 t              = dataset.t_threshold,
-                batch_size     = 2000,
+                batch_size     = args.batch_size,
                 consolidate    = True,
             )
             print("Uploading results to S3…")
@@ -416,43 +454,214 @@ def section_visualization(args, dataset, store):
         n = len(store.get_computed_users(period, "all_scalars"))
         print(f"  {period:25s}  {n:>8,} users")
 
+    def _plot_one(label: str, fn) -> None:
+        """
+        Run a single plot function, then immediately close all open
+        matplotlib figures and force a full garbage-collection cycle.
+
+        Processing one plot at a time keeps peak RSS bounded: the large
+        arrays loaded by each ``_load_*`` helper (especially the S(t)
+        matrix, which can exceed several GB) are freed before the next
+        plot starts, preventing accumulation that would otherwise exhaust
+        RAM and drop the SSH connection.
+        """
+        print(f"  {label}")
+        try:
+            fn()
+        except Exception as exc:
+            print(f"    WARNING — {label} failed: {exc}")
+        finally:
+            plt.close("all")   # release all figure objects and their arrays
+            gc.collect()       # reclaim memory immediately before next load
+
     print("\nGenerating plots…")
 
-    print("  3.1 Radius of Gyration")
-    plt_obj.plot_rg()
-    plt_obj.plot_rg_party_per_period()
-    plt_obj.plot_rg_rurality_per_period()
+    _plot_one("3.1 Radius of Gyration",                 plt_obj.plot_rg)
+    _plot_one("3.1 Radius of Gyration (party)",         plt_obj.plot_rg_party_per_period)
+    _plot_one("3.1 Radius of Gyration (rurality)",      plt_obj.plot_rg_rurality_per_period)
 
-    print("  3.2 Weekly Radius of Gyration")
-    plt_obj.plot_weekly_rg()
-    plt_obj.plot_rg_rurality_weekly()
-    plt_obj.plot_rg_party_weekly()
+    _plot_one("3.2 Weekly Radius of Gyration",          plt_obj.plot_weekly_rg)
+    _plot_one("3.2 Weekly RG (rurality)",               plt_obj.plot_rg_rurality_weekly)
+    _plot_one("3.2 Weekly RG (party)",                  plt_obj.plot_rg_party_weekly)
 
-    print("  3.3 k-Radius of Gyration")
-    plt_obj.plot_krg()
+    _plot_one("3.3 k-Radius of Gyration",               plt_obj.plot_krg)
 
-    print("  3.4 Distance")
-    plt_obj.plot_distance()
+    _plot_one("3.4 Distance",                           plt_obj.plot_distance)
 
-    print("  3.5 Entropy")
-    plt_obj.plot_entropy()
+    _plot_one("3.5 Entropy",                            plt_obj.plot_entropy)
 
-    print("  3.6 Exploration Curve S(t)")
-    plt_obj.plot_St()
+    # S(t) is the most RAM-intensive plot: it loads a [n_steps × n_users]
+    # matrix per period.  Running it in isolation ensures all prior data
+    # has already been freed before this load, and the S matrix is fully
+    # released before any subsequent plot starts.
+    _plot_one("3.6 Exploration Curve S(t)",             plt_obj.plot_St)
 
-    print("  3.7 Location Frequency")
-    plt_obj.plot_frequency()
+    _plot_one("3.7 Location Frequency",                 plt_obj.plot_frequency)
 
-    print("  3.8 Gonzalez Trajectory Shape")
-    plt_obj.plot_gonzalez()
-    plt_obj.plot_sigmaxy()
+    _plot_one("3.8 Gonzalez Trajectory Shape",          plt_obj.plot_gonzalez)
+    _plot_one("3.8 Gonzalez σ_x σ_y",                  plt_obj.plot_sigmaxy)
 
     print("All plots saved.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Entry point
+# Section 4a — S3 CONSOLIDATION  (MODE B finalisation)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def section_s3_consolidate(args, store):
+    """Merge per-shard S3 files into consolidated.parquet for every period."""
+    print("\n" + "─" * 60)
+    print("SECTION 4a · S3 CONSOLIDATION")
+    print("─" * 60)
+
+    upload_endpoint = args.s3_endpoint or S3_ENDPOINT_URL
+    upload_bucket   = S3_OUTPUT_BUCKET
+    upload_prefix   = S3_OUTPUT_PREFIX[args.region]
+
+    print(f"S3 target : s3://{upload_bucket}/{upload_prefix}")
+    print(f"Endpoint  : {upload_endpoint}")
+    print(f"Region    : {args.region}")
+    print("\nRunning final S3 consolidation for all periods …")
+
+    for period in PERIOD_NAMES:
+        print(f"\n  Period: {period!r}")
+        store.consolidate_s3_shards(
+            period,
+            s3_bucket           = upload_bucket,
+            s3_prefix           = upload_prefix,
+            endpoint_url        = upload_endpoint,
+            delete_shards_after = True,
+            verbose             = True,
+        )
+
+    print("\nFinal consolidation complete.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 4b — S3 UPLOAD  (MODE A / MODE C)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def section_s3_upload(args, store):
+    """Push local parquet results to S3 (MODE A / MODE C)."""
+    print("\n" + "─" * 60)
+    print("SECTION 4b · S3 UPLOAD (local → S3)")
+    print("─" * 60)
+
+    upload_endpoint = args.s3_endpoint or S3_ENDPOINT_URL
+    upload_bucket   = S3_OUTPUT_BUCKET
+    upload_prefix   = S3_OUTPUT_PREFIX[args.region]
+
+    periods_on_s3 = store.list_s3_computed_periods(
+        s3_bucket    = upload_bucket,
+        s3_prefix    = upload_prefix,
+        endpoint_url = upload_endpoint,
+    )
+    periods_to_upload = [p for p in PERIOD_NAMES if p not in periods_on_s3]
+
+    print(f"Periods already on S3 : {periods_on_s3 or 'none'}")
+    print(f"Periods to upload     : {periods_to_upload or 'none'}")
+
+    if not periods_to_upload:
+        print("All periods already on S3. Nothing to upload.")
+        return
+
+    upload_results = store.upload_all_to_s3(
+        period_names      = periods_to_upload,
+        s3_bucket         = upload_bucket,
+        s3_prefix         = upload_prefix,
+        endpoint_url      = upload_endpoint,
+        delete_after      = True,
+        consolidate_first = True,
+        verbose           = True,
+    )
+
+    print("\nUpload summary:")
+    for period, kinds in upload_results.items():
+        for kind, ok in kinds.items():
+            status = "✓" if ok else "✗"
+            print(f"  {status}  {period:25s}  {kind}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 4c — GAP ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def section_gap_analysis(args, dataset, store):
+    """Produce the four methodological gap-analysis figures."""
+    print("\n" + "─" * 60)
+    print("SECTION 4c · GAP ANALYSIS")
+    print("─" * 60)
+
+    plt_obj = plotter(
+        np_             = dataset.np_,
+        period_division = dataset.period_division,
+        period_names    = dataset.period_names,
+        t_threshold     = dataset.t_threshold,
+        region          = args.region,
+        county2party    = dataset.county2party,
+        df_rurality     = dataset.df_rurality,
+        output_dir      = args.output_dir,
+        store           = store,
+    )
+
+    print("  Gap 1: NPI event timeline")
+    fig_gap1 = plt_obj.plot_gap1_npi_timeline(save=True)
+    plt.close(fig_gap1)
+
+    print("  Gap 2: Sampling bias")
+    fig_gap2 = plt_obj.plot_gap2_sampling_bias(save=True)
+    plt.close(fig_gap2)
+
+    print("  Gap 3: Party / rurality conflation")
+    fig_gap3 = plt_obj.plot_gap3_party_rurality(metric="radius_gyration", save=True)
+    plt.close(fig_gap3)
+
+    print("  Gap 4: Post-lockdown asymmetry")
+    fig_gap4 = plt_obj.plot_gap4_post_lockdown_asymmetry(metric="radius_gyration", save=True)
+    plt.close(fig_gap4)
+
+    print("All gap-analysis plots saved.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section 5 — TRANSITION MATRICES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def section_transition_matrices(args, dataset):
+    """Compute presence and transition matrices on a geohash grid and upload to S3."""
+    print("\n" + "─" * 60)
+    print("SECTION 5 · TRANSITION MATRICES")
+    print("─" * 60)
+
+    s3_endpoint = args.s3_endpoint or S3_ENDPOINT_URL
+
+    print(f"Building geohash grid (precision={args.geohash_precision}) for {args.region} …")
+    grid = tile_counties_via_geohash(dataset.geojson, precision=args.geohash_precision)
+    print(f"  Grid cells: {len(grid):,}")
+
+    tm_pipeline = TransitionPipeline(
+        dataset           = dataset,
+        geohash_precision = args.geohash_precision,
+        delta_time_h      = args.delta_time_h,
+        endpoint_url      = s3_endpoint,
+        bucket            = S3_OUTPUT_BUCKET,
+        s3_prefix         = S3_TRANSITION_PREFIX[args.region],
+        temp_dir          = None,     # uses /tmp/humobcov_transitions by default
+        keep_local        = False,
+    )
+
+    tm_pipeline.summary()
+
+    results = tm_pipeline.run_all_periods(force=False, verbose=True)
+
+    print("\nTransition matrix run summary:")
+    for period, kinds in results.items():
+        for kind, ok in kinds.items():
+            status = "✓" if ok else "✗ (temp file kept locally)"
+            print(f"  {status}  {period:25s}  {kind}")
+
+
+
 
 def main():
     args = parse_args()
@@ -463,15 +672,28 @@ def main():
     if not args.skip_pipeline:
         store = section_main(args, dataset, cfg)
 
+    # Ensure store is available for downstream sections
+    if store is None:
+        store = ParquetStore(
+            base_dir    = DIR_MILESTONES_SERVER / args.region,
+            np_         = dataset.np_,
+            t_threshold = dataset.t_threshold,
+        )
+
+    if args.consolidate_s3:
+        section_s3_consolidate(args, store)
+
+    if args.upload_to_s3:
+        section_s3_upload(args, store)
+
     if args.visualize:
-        if store is None:
-            # Build a store object even when the pipeline was skipped
-            store = ParquetStore(
-                base_dir    = DIR_MILESTONES_SERVER / args.region,
-                np_         = dataset.np_,
-                t_threshold = dataset.t_threshold,
-            )
         section_visualization(args, dataset, store)
+
+    if args.gap_analysis:
+        section_gap_analysis(args, dataset, store)
+
+    if args.transition_matrices:
+        section_transition_matrices(args, dataset)
 
 
 if __name__ == "__main__":

@@ -30,7 +30,6 @@ orchestrator to use the new columnar parquet backend.
 
 import json
 import os
-import subprocess
 import time
 from pathlib import Path
 from collections import defaultdict
@@ -590,38 +589,13 @@ def analyze_from_s3_progressive(
     _temp_dir.mkdir(parents=True, exist_ok=True)
 
     # ── 1. List available shards on S3 ─────────────────────────────────────
+    from .s3_io import s3_list, s3_download
+
     s3_uri = f"s3://{bucket}/{s3_prefix}"
     print(f"Listing shards at {s3_uri} (recursive) …")
-    result = subprocess.run(
-        [
-            "aws", "s3", "ls", s3_uri + "/",
-            "--endpoint-url", endpoint_url,
-            "--recursive",
-        ],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(
-            f"aws s3 ls failed:\n  stdout: {result.stdout}\n  stderr: {result.stderr}"
-        )
-
-    # With --recursive the last column is the full S3 key relative to the bucket
-    # root (e.g. "shared/cuebiq/MOBS/.../part-00000.parquet").  We use the full
-    # key as the stable checkpoint identifier and derive the local filename from
-    # the basename so that a flat temp-directory is always used.
-    # Entries whose last column is a directory prefix ("PRE …") never end in
-    # ".parquet" and are naturally excluded.
-    shard_full_keys: list[str] = [
-        line.split()[-1]
-        for line in result.stdout.strip().splitlines()
-        if line.strip() and line.split()[-1].endswith(".parquet")
-    ]
+    shard_full_keys = s3_list(bucket, s3_prefix, endpoint_url, suffix=".parquet")
     if not shard_full_keys:
         print(f"No .parquet shards found at {s3_uri}. Nothing to do.")
-        # Print the raw listing to aid debugging
-        if result.stdout.strip():
-            preview = "\n  ".join(result.stdout.strip().splitlines()[:10])
-            print(f"  Raw listing (first 10 lines):\n  {preview}")
         return
 
     # Deduplicate basenames: if two keys share the same basename, append a
@@ -678,14 +652,9 @@ def analyze_from_s3_progressive(
         print(f"\n[{shard_idx + 1}/{len(pending_keys)}] Processing {shard_key} …")
 
         # 3a. Download
-        print(f"  Downloading from {s3_key} …")
-        dl = subprocess.run(
-            ["aws", "s3", "cp", s3_key, str(local_path),
-             "--endpoint-url", endpoint_url],
-            capture_output=True, text=True,
-        )
-        if dl.returncode != 0:
-            print(f"  WARNING: download failed — skipping shard.\n  {dl.stderr.strip()}")
+        print(f"  Downloading from s3://{bucket}/{shard_key} …")
+        if not s3_download(bucket, shard_key, local_path, endpoint_url):
+            print(f"  WARNING: download failed — skipping shard.")
             continue
 
         # 3b. Preprocess

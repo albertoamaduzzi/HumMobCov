@@ -6,16 +6,22 @@ HumMobCov *final_pipeline*.
 
 Design goals
 ------------
-* **No local storage by default** — results are computed in memory and
-  uploaded directly to S3.  A minimal temp file is written and deleted
-  after a confirmed upload.
-* **Modular** — each conceptual step is a standalone function so it can be
-  tested, profiled and reused independently.
-* **Resume-safe** — a lightweight JSON cache index on S3 records what
-  (region, period, precision) combinations are already computed.  Re-running
-  the pipeline is a no-op for completed combinations.
-* **Polars throughout** — all DataFrame operations use Polars for zero-copy,
-  parallel group-by and joins.
+* **No AWS CLI** — all S3 operations use ``boto3`` via ``src.s3_io``.
+* **S3-progressive** — raw trajectory shards are downloaded from S3 one at a
+  time, counts are accumulated in memory / on disk, then the final matrices
+  are uploaded and local temp files deleted.  No need for a large local disk.
+* **Resume-safe** — a per-period JSON shard checkpoint (stored locally in
+  ``temp_dir``) records which raw shards have been processed.  Re-running the
+  pipeline continues from the first unprocessed shard.  Completed periods are
+  skipped via a JSON cache index on S3.
+* **Incremental accumulation** — because shards are partitioned by user
+  (each user appears in exactly one shard), raw count tables are additive
+  across shards.  Probabilities are computed once at the end after merging all
+  shard contributions.
+* **Local fallback** — when no ``raw_bucket`` / ``raw_s3_prefix`` are
+  provided, the pipeline falls back to loading from local files defined in
+  ``dataset.dir_files``.
+* **Polars throughout** — all DataFrame operations use Polars.
 
 Output schema
 -------------
@@ -42,35 +48,25 @@ Output schema
 | datetime                | Utf8    | ISO-8601 of bin T start (UTC)                    |
 | transitions             | Int64   | number of distinct users making this move        |
 | transition_probability  | Float64 | transitions / Σ(transitions) leaving geohash_start|
-
-Usage
------
->>> from src.datasets import DataSet_California
->>> from src.transition_matrices import TransitionPipeline
->>>
->>> dataset   = DataSet_California()
->>> pipeline  = TransitionPipeline(
-...     dataset          = dataset,
-...     geohash_precision= 5,
-...     delta_time_h     = 1,
-...     endpoint_url     = "https://s3.atlas.fbk.eu",
-...     bucket           = "chub-datalake",
-...     s3_prefix        = "final_pipeline/CA/transition_matrices",
-...     temp_dir         = None,    # uses /tmp by default
-...     keep_local       = False,   # delete after upload (default)
-... )
->>> pipeline.run_period("15 jan - 15 march")
 """
 
 from __future__ import annotations
 
 import json
-import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Literal
 
 import polars as pl
+
+from ..s3_io import (
+    s3_upload,
+    s3_download,
+    s3_list,
+    s3_read_parquet,
+    s3_read_json,
+    s3_write_json,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -91,33 +87,12 @@ def build_time_bins(
         time_int = floor((unix_timestamp - global_min) / delta_seconds)
 
     so bin 0 starts at the earliest timestamp in the data.
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Must contain a column *datetime_col* that is parseable as
-        ``pl.Datetime`` (or already is one).
-    datetime_col : str
-        Name of the datetime column.  Default ``"datetime"``.
-    delta_h : float
-        Bin width in hours.  Default 1.0.
-
-    Returns
-    -------
-    pl.DataFrame
-        Original columns plus:
-
-        * ``time_int``    — ``Int64`` bin index (0-based)
-        * ``bin_datetime``— ``Utf8`` ISO-8601 string of the bin start
     """
     delta_s = int(delta_h * 3600)
 
-    # Ensure datetime dtype
     df = df.with_columns(
         pl.col(datetime_col).cast(pl.Datetime("us")).alias(datetime_col)
     )
-
-    # Unix timestamps in seconds
     df = df.with_columns(
         (pl.col(datetime_col).dt.epoch(time_unit="s")).alias("_ts_s")
     )
@@ -127,8 +102,6 @@ def build_time_bins(
     df = df.with_columns(
         ((pl.col("_ts_s") - t_min) // delta_s).cast(pl.Int64).alias("time_int")
     )
-
-    # Bin-start datetime: t_min + time_int * delta_s
     df = df.with_columns(
         (
             pl.from_epoch(t_min + pl.col("time_int") * delta_s, time_unit="s")
@@ -145,7 +118,11 @@ def _coarsen_geohash_col(df: pl.DataFrame, col: str, precision: int) -> pl.DataF
     return df.with_columns(pl.col(col).str.slice(0, precision).alias(col))
 
 
-def compute_presence_matrix(
+# ---------------------------------------------------------------------------
+# Raw-count variants (no probability columns — additive across user-shards)
+# ---------------------------------------------------------------------------
+
+def compute_presence_counts(
     df: pl.DataFrame,
     *,
     uid_col: str = "userId",
@@ -155,50 +132,18 @@ def compute_presence_matrix(
     geohash_precision: int | None = None,
 ) -> pl.DataFrame:
     """
-    Compute the presence matrix from a time-binned trajectory DataFrame.
+    Compute raw presence counts from a time-binned trajectory DataFrame.
 
-    For each (geohash, time_bin) pair the function counts:
+    Unlike :func:`compute_presence_matrix`, this function does **not** add a
+    ``probability`` column.  The returned table is additive across user-shards
+    so that counts from multiple shards can be summed before finalisation.
 
-    * **count_birth**: users whose *first stop in any cell* occurs in
-      this time bin (they "appear" for the first time).
-    * **count_death**: users whose *last stop in any cell* occurs in
-      this time bin (they "disappear").
-    * **count_transit**: users present in this bin who *also* have a
-      stop in the *following* bin (anywhere in the dataset).
-    * **count** = count_birth + count_death + count_transit
-    * **probability** = count_transit / Σ(count_transit) over all cells
-      for this bin.
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Must contain columns *uid_col*, *geohash_col*, *time_int_col*,
-        *bin_datetime_col*.  Must already be time-binned (see
-        :func:`build_time_bins`).
-    uid_col : str
-        User identifier column.
-    geohash_col : str
-        Geohash column at the target precision (or coarser — see
-        *geohash_precision*).
-    time_int_col : str
-        Integer time-bin index column.
-    bin_datetime_col : str
-        ISO-8601 bin-start datetime column.
-    geohash_precision : int, optional
-        If provided, truncate *geohash_col* to this many characters before
-        aggregation (coarse-graining).
-
-    Returns
-    -------
-    pl.DataFrame
-        Presence matrix with columns:
-        geohash, time_int, datetime, count_birth, count_death,
-        count_transit, count, probability.
+    Returns columns: ``geohash, time_int, datetime,
+    count_birth, count_death, count_transit``
     """
     if geohash_precision is not None:
         df = _coarsen_geohash_col(df, geohash_col, geohash_precision)
 
-    # ── per-user global first / last bin ─────────────────────────────────────
     user_range = (
         df
         .group_by(uid_col)
@@ -208,24 +153,16 @@ def compute_presence_matrix(
         ])
     )
 
-    # ── base: unique (uid, geohash, time_int) presence ───────────────────────
     presence = (
         df
         .select([uid_col, geohash_col, time_int_col, bin_datetime_col])
         .unique()
     )
 
-    # ── join user range onto presence ─────────────────────────────────────────
     presence = presence.join(user_range, on=uid_col, how="left")
 
-    # ── per-uid, per-bin: is the user present in the *next* bin (anywhere)? ──
-    # Build a (uid, time_int) table of ALL presence for the "next" bin lookup.
     uid_bins = presence.select([uid_col, time_int_col]).unique()
-    uid_bins_next = uid_bins.with_columns(
-        (pl.col(time_int_col) - 1).alias("prev_bin")
-    ).rename({uid_col: uid_col + "_r", time_int_col: time_int_col + "_r"})
 
-    # ── count_birth: users whose first_bin == current bin ────────────────────
     births = (
         presence
         .filter(pl.col(time_int_col) == pl.col("first_bin"))
@@ -233,7 +170,6 @@ def compute_presence_matrix(
         .agg(pl.col(uid_col).n_unique().alias("count_birth"))
     )
 
-    # ── count_death: users whose last_bin == current bin ─────────────────────
     deaths = (
         presence
         .filter(pl.col(time_int_col) == pl.col("last_bin"))
@@ -241,18 +177,7 @@ def compute_presence_matrix(
         .agg(pl.col(uid_col).n_unique().alias("count_death"))
     )
 
-    # ── count_transit: users present in bin T who also appear in bin T+1 ─────
-    # Join presence with uid_bins shifted by -1 to find "next bin" users.
-    transit_flags = (
-        presence
-        .join(
-            uid_bins.rename({time_int_col: "next_bin"}),
-            left_on=[uid_col, time_int_col],
-            right_on=[uid_col + "", "next_bin"],  # workaround: join on uid + (t+1 in the other)
-            how="left",
-        )
-    )
-    # A simpler approach: for each uid in a bin, check if uid is in uid_bins at bin+1
+    # count_transit: users in bin T who also appear in bin T+1
     next_bin_users = (
         uid_bins
         .with_columns((pl.col(time_int_col) - 1).alias("current_bin"))
@@ -264,7 +189,7 @@ def compute_presence_matrix(
         next_bin_users.rename({"current_bin": time_int_col}),
         left_on=[uid_col, time_int_col],
         right_on=[uid_col + "_next", time_int_col],
-        how="inner",  # only rows where uid appears in next bin too
+        how="inner",
     )
 
     transits = (
@@ -273,14 +198,12 @@ def compute_presence_matrix(
         .agg(pl.col(uid_col).n_unique().alias("count_transit"))
     )
 
-    # ── base aggregation (for datetime and total users per bin-geohash) ───────
     base = (
         presence
         .group_by([geohash_col, time_int_col])
         .agg(pl.col(bin_datetime_col).first().alias("datetime"))
     )
 
-    # ── assemble ──────────────────────────────────────────────────────────────
     result = (
         base
         .join(births,   on=[geohash_col, time_int_col], how="left")
@@ -291,33 +214,188 @@ def compute_presence_matrix(
             pl.col("count_death").fill_null(0),
             pl.col("count_transit").fill_null(0),
         ])
-        .with_columns(
-            (pl.col("count_birth") + pl.col("count_death") + pl.col("count_transit"))
-            .alias("count")
-        )
     )
 
-    # ── probability = count_transit / Σ(count_transit) per bin ───────────────
+    return result.rename({geohash_col: "geohash", time_int_col: "time_int"})[
+        ["geohash", "time_int", "datetime",
+         "count_birth", "count_death", "count_transit"]
+    ].sort(["time_int", "geohash"])
+
+
+def compute_transition_counts(
+    df: pl.DataFrame,
+    *,
+    uid_col: str = "userId",
+    geohash_col: str = "geohash",
+    time_int_col: str = "time_int",
+    bin_datetime_col: str = "bin_datetime",
+    geohash_precision: int | None = None,
+) -> pl.DataFrame:
+    """
+    Compute raw transition counts from time-binned trajectories.
+
+    Unlike :func:`compute_transition_matrix`, this function does **not** add a
+    ``transition_probability`` column.  The returned table is additive across
+    user-shards.
+
+    Returns columns: ``geohash_start, geohash_end, time_int, datetime,
+    transitions``
+    """
+    if geohash_precision is not None:
+        df = _coarsen_geohash_col(df, geohash_col, geohash_precision)
+
+    dt_sort_col = "datetime" if "datetime" in df.columns else bin_datetime_col
+    representative = (
+        df
+        .sort(dt_sort_col)
+        .group_by([uid_col, time_int_col])
+        .agg([
+            pl.col(geohash_col).last().alias("geohash_start"),
+            pl.col(bin_datetime_col).first().alias("datetime"),
+        ])
+    )
+
+    next_bin = (
+        representative
+        .with_columns((pl.col(time_int_col) - 1).alias("current_bin"))
+        .rename({
+            "geohash_start": "geohash_end",
+            uid_col:         uid_col + "_r",
+            time_int_col:    time_int_col + "_next",
+            "datetime":      "datetime_end",
+        })
+    )
+
+    transitions_raw = representative.join(
+        next_bin.select([uid_col + "_r", "current_bin", "geohash_end"]),
+        left_on=[uid_col, time_int_col],
+        right_on=[uid_col + "_r", "current_bin"],
+        how="inner",
+    )
+
+    result = (
+        transitions_raw
+        .group_by(["geohash_start", "geohash_end", time_int_col])
+        .agg([
+            pl.col(uid_col).n_unique().alias("transitions"),
+            pl.col("datetime").first().alias("datetime"),
+        ])
+    )
+
+    return result.rename({time_int_col: "time_int"})[
+        ["geohash_start", "geohash_end", "time_int", "datetime", "transitions"]
+    ].sort(["time_int", "geohash_start", "geohash_end"])
+
+
+# ---------------------------------------------------------------------------
+# Merge helpers
+# ---------------------------------------------------------------------------
+
+def merge_presence_counts(frames: list[pl.DataFrame]) -> pl.DataFrame:
+    """Merge per-shard presence count tables by summing counts."""
+    merged = pl.concat(frames, how="diagonal_relaxed")
+    return (
+        merged
+        .group_by(["geohash", "time_int"])
+        .agg([
+            pl.col("datetime").first(),
+            pl.col("count_birth").sum(),
+            pl.col("count_death").sum(),
+            pl.col("count_transit").sum(),
+        ])
+        .sort(["time_int", "geohash"])
+    )
+
+
+def merge_transition_counts(frames: list[pl.DataFrame]) -> pl.DataFrame:
+    """Merge per-shard transition count tables by summing transitions."""
+    merged = pl.concat(frames, how="diagonal_relaxed")
+    return (
+        merged
+        .group_by(["geohash_start", "geohash_end", "time_int"])
+        .agg([
+            pl.col("datetime").first(),
+            pl.col("transitions").sum(),
+        ])
+        .sort(["time_int", "geohash_start", "geohash_end"])
+    )
+
+
+# ---------------------------------------------------------------------------
+# Finalise helpers (add probability columns)
+# ---------------------------------------------------------------------------
+
+def finalise_presence(counts: pl.DataFrame) -> pl.DataFrame:
+    """Add ``count`` and ``probability`` columns to merged presence counts."""
+    result = counts.with_columns(
+        (pl.col("count_birth") + pl.col("count_death") + pl.col("count_transit"))
+        .alias("count")
+    )
     bin_totals = (
         result
-        .group_by(time_int_col)
+        .group_by("time_int")
         .agg(pl.col("count_transit").sum().alias("total_transit"))
     )
-    result = (
+    return (
         result
-        .join(bin_totals, on=time_int_col, how="left")
+        .join(bin_totals, on="time_int", how="left")
         .with_columns(
             (pl.col("count_transit") / pl.col("total_transit"))
             .fill_nan(0.0)
             .alias("probability")
         )
         .drop("total_transit")
+        .select(["geohash", "time_int", "datetime",
+                 "count_birth", "count_death", "count_transit",
+                 "count", "probability"])
+        .sort(["time_int", "geohash"])
     )
 
-    return result.rename({geohash_col: "geohash", time_int_col: "time_int"})[
-        ["geohash", "time_int", "datetime",
-         "count_birth", "count_death", "count_transit", "count", "probability"]
-    ].sort(["time_int", "geohash"])
+
+def finalise_transition(counts: pl.DataFrame) -> pl.DataFrame:
+    """Add ``transition_probability`` to merged transition counts."""
+    start_totals = (
+        counts
+        .group_by(["geohash_start", "time_int"])
+        .agg(pl.col("transitions").sum().alias("total_from_start"))
+    )
+    return (
+        counts
+        .join(start_totals, on=["geohash_start", "time_int"], how="left")
+        .with_columns(
+            (pl.col("transitions") / pl.col("total_from_start"))
+            .alias("transition_probability")
+        )
+        .drop("total_from_start")
+        .select(["geohash_start", "geohash_end", "time_int", "datetime",
+                 "transitions", "transition_probability"])
+        .sort(["time_int", "geohash_start", "geohash_end"])
+    )
+
+
+# ---------------------------------------------------------------------------
+# Full-matrix wrappers (backward-compatible one-shot versions)
+# ---------------------------------------------------------------------------
+
+def compute_presence_matrix(
+    df: pl.DataFrame,
+    *,
+    uid_col: str = "userId",
+    geohash_col: str = "geohash",
+    time_int_col: str = "time_int",
+    bin_datetime_col: str = "bin_datetime",
+    geohash_precision: int | None = None,
+) -> pl.DataFrame:
+    """Compute the full presence matrix (counts + probability) in one step."""
+    counts = compute_presence_counts(
+        df,
+        uid_col=uid_col,
+        geohash_col=geohash_col,
+        time_int_col=time_int_col,
+        bin_datetime_col=bin_datetime_col,
+        geohash_precision=geohash_precision,
+    )
+    return finalise_presence(counts)
 
 
 def compute_transition_matrix(
@@ -329,100 +407,16 @@ def compute_transition_matrix(
     bin_datetime_col: str = "bin_datetime",
     geohash_precision: int | None = None,
 ) -> pl.DataFrame:
-    """
-    Compute the transition matrix from time-binned trajectories.
-
-    A *transition* is the move of a user from cell A at time bin T to cell B
-    at time bin T+1.  Multiple stops of the same user in the same cell within
-    one bin are collapsed (only the last geohash of the bin is used as the
-    departure cell, and the first of the next bin as the arrival cell).
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        Time-binned trajectory data.  Required columns: *uid_col*,
-        *geohash_col*, *time_int_col*, *bin_datetime_col*.
-    uid_col : str
-        User identifier column.
-    geohash_col : str
-        Geohash column.
-    time_int_col : str
-        Integer time-bin index column.
-    bin_datetime_col : str
-        ISO-8601 bin-start datetime column.
-    geohash_precision : int, optional
-        Coarsen geohash to this precision before counting.
-
-    Returns
-    -------
-    pl.DataFrame
-        Transition matrix with columns:
-        geohash_start, geohash_end, time_int, datetime,
-        transitions, transition_probability.
-    """
-    if geohash_precision is not None:
-        df = _coarsen_geohash_col(df, geohash_col, geohash_precision)
-
-    # ── representative geohash per (uid, bin): take the *last* stop ──────────
-    # Sort by datetime to get temporal order.
-    representative = (
-        df
-        .sort(["datetime" if "datetime" in df.columns else bin_datetime_col])
-        .group_by([uid_col, time_int_col])
-        .agg([
-            pl.col(geohash_col).last().alias("geohash_start"),
-            pl.col(bin_datetime_col).first().alias("datetime"),
-        ])
+    """Compute the full transition matrix (counts + probability) in one step."""
+    counts = compute_transition_counts(
+        df,
+        uid_col=uid_col,
+        geohash_col=geohash_col,
+        time_int_col=time_int_col,
+        bin_datetime_col=bin_datetime_col,
+        geohash_precision=geohash_precision,
     )
-
-    # ── self-join on uid, next bin → get geohash_end ──────────────────────────
-    next_bin = representative.with_columns(
-        (pl.col(time_int_col) - 1).alias("prev_bin")
-    ).rename({
-        "geohash_start": "geohash_end",
-        uid_col:         uid_col + "_r",
-        time_int_col:    time_int_col + "_next",
-        "datetime":      "datetime_end",
-        "prev_bin":      "current_bin",
-    })
-
-    transitions_raw = representative.join(
-        next_bin.select([uid_col + "_r", "current_bin", "geohash_end"]),
-        left_on=[uid_col, time_int_col],
-        right_on=[uid_col + "_r", "current_bin"],
-        how="inner",
-    )
-
-    # ── aggregate: count distinct users per (start, end, bin) ────────────────
-    agg = (
-        transitions_raw
-        .group_by(["geohash_start", "geohash_end", time_int_col])
-        .agg([
-            pl.col(uid_col).n_unique().alias("transitions"),
-            pl.col("datetime").first().alias("datetime"),
-        ])
-    )
-
-    # ── transition probability: transitions / Σ(transitions) per (start, bin) -
-    start_totals = (
-        agg
-        .group_by(["geohash_start", time_int_col])
-        .agg(pl.col("transitions").sum().alias("total_from_start"))
-    )
-    result = (
-        agg
-        .join(start_totals, on=["geohash_start", time_int_col], how="left")
-        .with_columns(
-            (pl.col("transitions") / pl.col("total_from_start"))
-            .alias("transition_probability")
-        )
-        .drop("total_from_start")
-    )
-
-    return result[
-        ["geohash_start", "geohash_end", "time_int", "datetime",
-         "transitions", "transition_probability"]
-    ].sort(["time_int", "geohash_start", "geohash_end"])
+    return finalise_transition(counts)
 
 
 # ---------------------------------------------------------------------------
@@ -434,23 +428,7 @@ def save_compressed(
     path: Path,
     compression: Literal["lz4", "uncompressed", "snappy", "gzip", "brotli", "zstd"] = "zstd",
 ) -> Path:
-    """
-    Save a Polars DataFrame to a compressed parquet file.
-
-    Parameters
-    ----------
-    df : pl.DataFrame
-        DataFrame to save.
-    path : Path
-        Output file path.  Parent directory must exist.
-    compression : str
-        Parquet compression codec.  Default ``"zstd"`` (good ratio + speed).
-
-    Returns
-    -------
-    Path
-        The written file path.
-    """
+    """Save a Polars DataFrame to a compressed parquet file."""
     path = Path(path)
     df.write_parquet(path, compression=compression)
     return path
@@ -463,55 +441,67 @@ def save_compressed(
 class TransitionPipeline:
     """
     End-to-end pipeline: raw trajectories → transition / presence matrices
-    → S3 upload.
+    → S3 upload.  No AWS CLI required — all S3 operations use ``boto3``.
 
-    The pipeline is **resume-safe** via a JSON cache index that is read from
-    (and written to) S3 before each run.  Completed (region, period,
-    precision) triples are skipped.
+    S3-progressive mode (recommended)
+    ----------------------------------
+    Pass ``raw_bucket`` and ``raw_s3_prefix`` to load raw trajectory shards
+    directly from S3 one at a time.  For each shard the pipeline:
 
-    Data flow
-    ---------
-    1. Load raw parquet shard for the period from the dataset.
-    2. Coarsen geohash column to *geohash_precision* characters.
-    3. Bin timestamps into *delta_time_h*-hour bins (:func:`build_time_bins`).
-    4. Compute presence matrix (:func:`compute_presence_matrix`).
-    5. Compute transition matrix (:func:`compute_transition_matrix`).
-    6. Write both to a temp file (compressed parquet).
-    7. Upload to S3 → delete temp file on success.
-    8. Update the cache index on S3.
+    1. Downloads the shard to ``temp_dir``.
+    2. Filters to the period date range.
+    3. Coarsens geohash and bins time.
+    4. Computes raw presence and transition counts.
+    5. Accumulates counts into intermediate parquet files in ``temp_dir``.
+    6. Deletes the raw shard temp file.
+
+    After all shards are processed the counts are finalised (probabilities
+    added), uploaded to S3, and intermediate files deleted.
+
+    **Assumption**: shards are partitioned by user — each user appears in
+    exactly one shard.  This makes counts additive across shards.
+
+    Resume safety
+    -------------
+    * A per-period JSON checkpoint in ``temp_dir`` records which raw shards
+      have been processed.  Restarting the pipeline continues from the next
+      unprocessed shard and picks up intermediate parquet files.
+    * Completed periods are recorded in a JSON cache index on S3
+      (``s3_prefix/cache_index.json``) and are skipped on re-run.
+
+    Local fallback
+    --------------
+    If ``raw_bucket`` / ``raw_s3_prefix`` are not provided the pipeline loads
+    from ``dataset.dir_files`` (all files for the full period at once).
 
     Parameters
     ----------
     dataset : _BaseDataset
-        Initialised ``DataSet_California`` or ``DataSet_Massachusets``
-        instance.  Provides the raw file list, period definitions and
-        preprocessing parameters.
+        Initialised dataset object providing period definitions.
     geohash_precision : int
         Geohash precision for the grid.  Default 5.
-        Use 5 for CA/MA with 32 GB RAM.
     delta_time_h : float
         Time-bin width in hours.  Default 1.0.
     endpoint_url : str
-        S3-compatible endpoint URL.
-        Default ``"https://s3.atlas.fbk.eu"``.
+        S3 endpoint for the *output* store.
     bucket : str
-        S3 bucket.  Default ``"chub-datalake"``.
-    s3_prefix : str
-        Key prefix for this pipeline's output inside the bucket.
-        Default ``"final_pipeline/{region}/transition_matrices"``.
+        Output S3 bucket.
+    s3_prefix : str, optional
+        Key prefix for output files inside the bucket.
     temp_dir : Path or str, optional
-        Local directory for transient temp files.  Defaults to
-        ``/tmp/humobcov_transitions``.
+        Local directory for temp files.
+        Defaults to ``/tmp/humobcov_transitions``.
     keep_local : bool
-        If True, keep the local temp file after upload (useful when local
-        space is available).  Default False.
-    geohash_col : str
-        Name of the geohash column in the raw trajectory data.
-        Default ``"geohash"``.
-    uid_col : str
-        Name of the user-id column.  Default ``"userId"``.
-    datetime_col : str
-        Name of the datetime column.  Default ``"datetime"``.
+        Keep temp files after upload (default False).
+    geohash_col, uid_col, datetime_col : str
+        Column names in the raw trajectory data.
+    raw_bucket : str, optional
+        S3 bucket containing raw trajectory shards.
+        If None, falls back to loading from local files.
+    raw_s3_prefix : str, optional
+        S3 key prefix for raw trajectory shards.
+    raw_endpoint_url : str, optional
+        S3 endpoint for the raw data bucket.  Defaults to ``endpoint_url``.
     """
 
     _CACHE_KEY = "cache_index.json"
@@ -529,6 +519,9 @@ class TransitionPipeline:
         geohash_col: str = "geohash",
         uid_col: str = "userId",
         datetime_col: str = "datetime",
+        raw_bucket: str | None = None,
+        raw_s3_prefix: str | None = None,
+        raw_endpoint_url: str | None = None,
     ) -> None:
         self.dataset           = dataset
         self.geohash_precision = geohash_precision
@@ -539,131 +532,207 @@ class TransitionPipeline:
         self.uid_col           = uid_col
         self.datetime_col      = datetime_col
         self.keep_local        = keep_local
+        self.raw_bucket        = raw_bucket
+        self.raw_s3_prefix     = raw_s3_prefix
+        self.raw_endpoint_url  = raw_endpoint_url or endpoint_url
 
         region: str = getattr(dataset, "id_", "CA")
         if s3_prefix is None:
-            s3_prefix = (
-                f"final_pipeline/{region}/transition_matrices"
-            )
+            s3_prefix = f"final_pipeline/{region}/transition_matrices"
         self.s3_prefix = s3_prefix
 
-        self.temp_dir = Path(temp_dir) if temp_dir else Path(tempfile.gettempdir()) / "humobcov_transitions"
+        self.temp_dir = (
+            Path(temp_dir) if temp_dir
+            else Path(tempfile.gettempdir()) / "humobcov_transitions"
+        )
         self.temp_dir.mkdir(parents=True, exist_ok=True)
 
     # ------------------------------------------------------------------
-    # Cache index (on S3)
+    # Cache index (on S3 — marks completed periods)
     # ------------------------------------------------------------------
 
-    def _cache_s3_uri(self) -> str:
-        return f"s3://{self.bucket}/{self.s3_prefix}/{self._CACHE_KEY}"
-
     def _load_cache(self) -> dict:
-        """Download the JSON cache index from S3, or return empty dict."""
-        local_tmp = self.temp_dir / "_cache_index_tmp.json"
-        result = subprocess.run(
-            [
-                "aws", "s3", "cp",
-                self._cache_s3_uri(),
-                str(local_tmp),
-                "--endpoint-url", self.endpoint_url,
-            ],
-            capture_output=True, text=True,
+        data = s3_read_json(
+            self.bucket,
+            f"{self.s3_prefix}/{self._CACHE_KEY}",
+            self.endpoint_url,
         )
-        if result.returncode != 0 or not local_tmp.exists():
-            return {}
-        try:
-            with open(local_tmp) as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-        local_tmp.unlink(missing_ok=True)
-        return data
+        return data if isinstance(data, dict) else {}
 
     def _save_cache(self, cache: dict) -> None:
-        """Upload the JSON cache index to S3."""
-        local_tmp = self.temp_dir / "_cache_index_tmp.json"
-        with open(local_tmp, "w") as f:
-            json.dump(cache, f, indent=2)
-        subprocess.run(
-            [
-                "aws", "s3", "cp",
-                str(local_tmp),
-                self._cache_s3_uri(),
-                "--endpoint-url", self.endpoint_url,
-            ],
-            capture_output=True, text=True,
+        s3_write_json(
+            cache,
+            self.bucket,
+            f"{self.s3_prefix}/{self._CACHE_KEY}",
+            self.endpoint_url,
         )
-        local_tmp.unlink(missing_ok=True)
 
     def _cache_key(self, period: str, kind: str) -> str:
         safe = period.replace(" ", "_").replace("/", "-")
         return f"{safe}_prec{self.geohash_precision}_dh{self.delta_time_h}_{kind}"
 
-    def get_cache_status(self) -> dict[str, list[str]]:
-        """
-        Return a dict of already-computed (period, kind) pairs from the
-        S3 cache index.
-
-        Returns
-        -------
-        dict[str, list[str]]
-            ``{"15_jan_-_15_march_prec5_dh1.0_presence": "s3://...", ...}``
-        """
-        return self._load_cache()
-
     def is_computed(self, period: str, kind: str) -> bool:
-        """Check whether *(period, kind)* is already in the S3 cache."""
-        cache = self._load_cache()
-        return self._cache_key(period, kind) in cache
+        """Return True if *(period, kind)* is in the S3 cache."""
+        return self._cache_key(period, kind) in self._load_cache()
 
     # ------------------------------------------------------------------
-    # S3 upload helper
+    # Per-period shard checkpoint (local)
+    # ------------------------------------------------------------------
+
+    def _checkpoint_path(self, period: str) -> Path:
+        safe = period.replace(" ", "_").replace("/", "-")
+        return self.temp_dir / f"{safe}_checkpoint.json"
+
+    def _load_shard_checkpoint(self, period: str) -> set[str]:
+        p = self._checkpoint_path(period)
+        if not p.exists():
+            return set()
+        try:
+            with open(p) as f:
+                return set(json.load(f).get("completed_shards", []))
+        except Exception:
+            return set()
+
+    def _save_shard_checkpoint(self, period: str, completed: set[str]) -> None:
+        with open(self._checkpoint_path(period), "w") as f:
+            json.dump({"completed_shards": sorted(completed)}, f, indent=2)
+
+    # ------------------------------------------------------------------
+    # Intermediate accumulated-counts (local temp files)
+    # ------------------------------------------------------------------
+
+    def _partial_path(self, period: str, kind: str) -> Path:
+        safe = period.replace(" ", "_").replace("/", "-")
+        return self.temp_dir / f"partial_{kind}_counts_{safe}.parquet"
+
+    def _load_partial(self, period: str, kind: str) -> pl.DataFrame | None:
+        p = self._partial_path(period, kind)
+        if not p.exists():
+            return None
+        try:
+            return pl.read_parquet(p)
+        except Exception:
+            return None
+
+    def _save_partial(self, period: str, kind: str, df: pl.DataFrame) -> None:
+        df.write_parquet(self._partial_path(period, kind), compression="zstd")
+
+    def _clear_partial(self, period: str) -> None:
+        for kind in ("presence", "transition"):
+            self._partial_path(period, kind).unlink(missing_ok=True)
+        self._checkpoint_path(period).unlink(missing_ok=True)
+
+    # ------------------------------------------------------------------
+    # Output S3 key
+    # ------------------------------------------------------------------
+
+    def _period_s3_key(self, period: str, kind: str) -> str:
+        safe = period.replace(" ", "_").replace("/", "-")
+        fname = (
+            f"{kind}_prec{self.geohash_precision}_dh{self.delta_time_h}"
+            f"_{safe}.parquet"
+        )
+        return f"{self.s3_prefix}/{fname}"
+
+    # ------------------------------------------------------------------
+    # Upload helper
     # ------------------------------------------------------------------
 
     def _upload(self, local_path: Path, s3_key: str) -> bool:
-        """Upload a local file to S3.  Return True on success."""
-        s3_uri = f"s3://{self.bucket}/{s3_key}"
-        result = subprocess.run(
-            [
-                "aws", "s3", "cp",
-                str(local_path),
-                s3_uri,
-                "--endpoint-url", self.endpoint_url,
-            ],
-            capture_output=True, text=True,
-        )
-        if result.returncode != 0:
-            print(
-                f"  [S3 upload] FAILED {local_path.name} → {s3_uri}\n"
-                f"  stderr: {result.stderr.strip()}"
-            )
-            return False
-        if not self.keep_local:
+        ok = s3_upload(local_path, self.bucket, s3_key, self.endpoint_url)
+        if ok and not self.keep_local:
             local_path.unlink(missing_ok=True)
-        return True
+        return ok
 
     # ------------------------------------------------------------------
-    # Per-period processing
+    # Shard data processing (filter + coarsen + bin + count)
     # ------------------------------------------------------------------
 
-    def _load_period_trajectories(
-        self,
-        period: str,
-    ) -> pl.DataFrame | None:
-        """
-        Load raw trajectory stops for *period* from the dataset's raw files.
-
-        Reads all raw parquet shards, filters to the period's date range,
-        and returns a concatenated Polars DataFrame.
-
-        Returns None if no data is found.
-        """
+    def _filter_to_period(self, df: pl.DataFrame, period: str) -> pl.DataFrame:
         from ..constants import PERIOD_NAMES_TO_DIVISION
 
-        period_bounds = PERIOD_NAMES_TO_DIVISION.get(period)
-        if period_bounds is None:
+        bounds = PERIOD_NAMES_TO_DIVISION.get(period)
+        if bounds is None:
             raise ValueError(f"Unknown period: {period!r}")
-        start_dt, end_dt = period_bounds
+        start_dt, end_dt = bounds
+
+        dt_col = self.datetime_col
+        if dt_col not in df.columns:
+            for c in ("timestamp", "time", "stop_time", "start_time", "begin", "end"):
+                if c in df.columns:
+                    df = df.rename({c: dt_col})
+                    break
+
+        gh_col = self.geohash_col
+        if gh_col not in df.columns:
+            for c in ("geohash7", "geohash6", "geohash5", "geohash4"):
+                if c in df.columns:
+                    df = df.rename({c: gh_col})
+                    break
+
+        df = df.with_columns(
+            pl.col(dt_col).cast(pl.Datetime("us")).alias(dt_col)
+        )
+        return df.filter(
+            (pl.col(dt_col) >= pl.lit(start_dt).cast(pl.Datetime("us")))
+            & (pl.col(dt_col) < pl.lit(end_dt).cast(pl.Datetime("us")))
+        ).select(
+            [c for c in [self.uid_col, self.geohash_col, dt_col]
+             if c in df.columns]
+        )
+
+    def _accumulate_shard(
+        self,
+        df: pl.DataFrame,
+        period: str,
+        acc_presence: pl.DataFrame | None,
+        acc_transition: pl.DataFrame | None,
+    ) -> tuple[pl.DataFrame | None, pl.DataFrame | None]:
+        """Filter *df* to *period*, compute counts, and merge into accumulators."""
+        filtered = self._filter_to_period(df, period)
+        if filtered.height == 0:
+            return acc_presence, acc_transition
+
+        filtered = _coarsen_geohash_col(
+            filtered, self.geohash_col, self.geohash_precision
+        )
+        filtered = build_time_bins(
+            filtered,
+            datetime_col=self.datetime_col,
+            delta_h=self.delta_time_h,
+        )
+
+        pres = compute_presence_counts(
+            filtered,
+            uid_col=self.uid_col,
+            geohash_col=self.geohash_col,
+            time_int_col="time_int",
+            bin_datetime_col="bin_datetime",
+        )
+        trans = compute_transition_counts(
+            filtered,
+            uid_col=self.uid_col,
+            geohash_col=self.geohash_col,
+            time_int_col="time_int",
+            bin_datetime_col="bin_datetime",
+        )
+
+        acc_presence  = pres  if acc_presence  is None else merge_presence_counts(  [acc_presence,  pres])
+        acc_transition = trans if acc_transition is None else merge_transition_counts([acc_transition, trans])
+
+        return acc_presence, acc_transition
+
+    # ------------------------------------------------------------------
+    # Local fallback: load all period data from dataset.dir_files
+    # ------------------------------------------------------------------
+
+    def _load_local(self, period: str) -> pl.DataFrame | None:
+        from ..constants import PERIOD_NAMES_TO_DIVISION
+
+        bounds = PERIOD_NAMES_TO_DIVISION.get(period)
+        if bounds is None:
+            raise ValueError(f"Unknown period: {period!r}")
+        start_dt, end_dt = bounds
 
         frames: list[pl.DataFrame] = []
         for fpath in getattr(self.dataset, "dir_files", []):
@@ -673,17 +742,19 @@ class TransitionPipeline:
             try:
                 lf = pl.scan_parquet(fp)
                 schema = lf.schema
-
-                # Identify datetime column
                 dt_col = self.datetime_col
                 if dt_col not in schema:
-                    # Try common alternatives
-                    for c in ["timestamp", "time", "stop_time", "start_time"]:
+                    for c in ("timestamp", "time", "stop_time", "start_time", "begin", "end"):
                         if c in schema:
                             dt_col = c
                             break
-
-                df_chunk = (
+                gh_col = self.geohash_col
+                if gh_col not in schema:
+                    for c in ("geohash7", "geohash6", "geohash5", "geohash4"):
+                        if c in schema:
+                            gh_col = c
+                            break
+                chunk = (
                     lf
                     .with_columns(
                         pl.col(dt_col).cast(pl.Datetime("us")).alias(dt_col)
@@ -693,31 +764,27 @@ class TransitionPipeline:
                         & (pl.col(dt_col) < pl.lit(end_dt).cast(pl.Datetime("us")))
                     )
                     .select(
-                        [c for c in [self.uid_col, self.geohash_col, dt_col]
+                        [c for c in [self.uid_col, gh_col, dt_col]
                          if c in schema]
                     )
                     .collect()
                 )
-                if df_chunk.height > 0:
+                if chunk.height > 0:
                     if dt_col != self.datetime_col:
-                        df_chunk = df_chunk.rename({dt_col: self.datetime_col})
-                    frames.append(df_chunk)
+                        chunk = chunk.rename({dt_col: self.datetime_col})
+                    if gh_col != self.geohash_col:
+                        chunk = chunk.rename({gh_col: self.geohash_col})
+                    frames.append(chunk)
             except Exception as exc:
                 print(f"  WARNING: could not read {fp.name}: {exc}")
-                continue
 
         if not frames:
             return None
         return pl.concat(frames, how="vertical_relaxed")
 
-    def _period_s3_key(self, period: str, kind: str) -> str:
-        """S3 key for the output file of *(period, kind)*."""
-        safe = period.replace(" ", "_").replace("/", "-")
-        fname = (
-            f"{kind}_prec{self.geohash_precision}_dh{self.delta_time_h}"
-            f"_{safe}.parquet"
-        )
-        return f"{self.s3_prefix}/{fname}"
+    # ------------------------------------------------------------------
+    # Main run: per-period
+    # ------------------------------------------------------------------
 
     def run_period(
         self,
@@ -728,36 +795,28 @@ class TransitionPipeline:
         """
         Run the full pipeline for a single *period*.
 
-        Steps:
-        1. Check cache — skip if already computed (unless *force=True*).
-        2. Load raw trajectory data for the period.
-        3. Coarsen geohash to *geohash_precision*.
-        4. Build time bins.
-        5. Compute presence matrix.
-        6. Compute transition matrix.
-        7. Write both to compressed temp parquet files.
-        8. Upload to S3 and delete temp files.
-        9. Update cache index.
+        When ``raw_bucket`` / ``raw_s3_prefix`` are set, shards are downloaded
+        one at a time from S3 and counts accumulated progressively.
+        Otherwise, all data for the period is loaded from local files at once.
 
         Parameters
         ----------
         period : str
             Period name (e.g. ``"15 jan - 15 march"``).
         force : bool
-            If True, re-compute even if the cache says it is done.
+            Re-compute even if already recorded in the S3 cache.
         verbose : bool
             Print progress messages.
 
         Returns
         -------
         dict[str, bool]
-            ``{"presence": True/False, "transition": True/False}``
+            ``{"presence": bool, "transition": bool}``
         """
         results = {"presence": False, "transition": False}
         cache = self._load_cache()
 
-        # ── 1. Resume check ──────────────────────────────────────────────
-        skip_presence   = (not force) and (self._cache_key(period, "presence") in cache)
+        skip_presence   = (not force) and (self._cache_key(period, "presence")   in cache)
         skip_transition = (not force) and (self._cache_key(period, "transition") in cache)
 
         if skip_presence and skip_transition:
@@ -765,168 +824,235 @@ class TransitionPipeline:
                 print(f"  [skip] {period!r} — both matrices already on S3.")
             return {"presence": True, "transition": True}
 
-        # ── 2. Load raw data ─────────────────────────────────────────────
-        if verbose:
-            print(f"\n[{period}] Loading raw trajectories …")
-        df = self._load_period_trajectories(period)
-        if df is None or df.height == 0:
-            print(f"  WARNING: no data found for period {period!r}. Skipping.")
+        # ── Accumulate raw counts ────────────────────────────────────────
+        if self.raw_bucket and self.raw_s3_prefix:
+            acc_pres, acc_trans = self._run_s3_progressive(
+                period, force=force, verbose=verbose
+            )
+        else:
+            if verbose:
+                print(f"\n[{period}] Loading from local files …")
+            df = self._load_local(period)
+            if df is None or df.height == 0:
+                print(f"  WARNING: no local data for {period!r}. Skipping.")
+                return results
+            if verbose:
+                print(
+                    f"  {df.height:,} stops, "
+                    f"{df[self.uid_col].n_unique():,} users."
+                )
+            df = _coarsen_geohash_col(df, self.geohash_col, self.geohash_precision)
+            df = build_time_bins(
+                df, datetime_col=self.datetime_col, delta_h=self.delta_time_h
+            )
+            acc_pres  = compute_presence_counts(
+                df, uid_col=self.uid_col, geohash_col=self.geohash_col,
+                time_int_col="time_int", bin_datetime_col="bin_datetime",
+            )
+            acc_trans = compute_transition_counts(
+                df, uid_col=self.uid_col, geohash_col=self.geohash_col,
+                time_int_col="time_int", bin_datetime_col="bin_datetime",
+            )
+
+        if acc_pres is None or acc_trans is None:
+            print(f"  WARNING: no data produced for {period!r}.")
             return results
 
-        if verbose:
-            print(f"  Loaded {df.height:,} stops for {df[self.uid_col].n_unique():,} users.")
-
-        # ── 3. Coarsen geohash ───────────────────────────────────────────
-        if verbose:
-            print(f"  Coarsening geohash to precision {self.geohash_precision} …")
-        df = _coarsen_geohash_col(df, self.geohash_col, self.geohash_precision)
-
-        # ── 4. Time binning ──────────────────────────────────────────────
-        if verbose:
-            print(f"  Binning into {self.delta_time_h}h bins …")
-        df = build_time_bins(df, datetime_col=self.datetime_col, delta_h=self.delta_time_h)
-
-        # ── 5 & 6. Compute matrices ──────────────────────────────────────
-        for kind, skip, compute_fn in [
-            ("presence",   skip_presence,   compute_presence_matrix),
-            ("transition", skip_transition, compute_transition_matrix),
+        # ── Finalise and upload ──────────────────────────────────────────
+        for kind, skip, counts, finalise_fn in [
+            ("presence",   skip_presence,   acc_pres,  finalise_presence),
+            ("transition", skip_transition, acc_trans, finalise_transition),
         ]:
             if skip:
                 if verbose:
-                    print(f"  [skip] {kind} matrix already on S3.")
+                    print(f"  [skip] {kind} already on S3.")
                 results[kind] = True
                 continue
 
             if verbose:
-                print(f"  Computing {kind} matrix …")
+                print(f"  Finalising {kind} matrix …")
 
-            matrix = compute_fn(
-                df,
-                uid_col=self.uid_col,
-                geohash_col=self.geohash_col,
-                time_int_col="time_int",
-                bin_datetime_col="bin_datetime",
-                geohash_precision=None,   # already coarsened above
-            )
+            matrix = finalise_fn(counts)
 
-            # ── 7. Write temp file ────────────────────────────────────────
-            safe_period = period.replace(" ", "_").replace("/", "-")
+            safe = period.replace(" ", "_").replace("/", "-")
             tmp_fname = (
-                f"{kind}_prec{self.geohash_precision}_dh{self.delta_time_h}"
-                f"_{safe_period}.parquet"
+                f"{kind}_prec{self.geohash_precision}"
+                f"_dh{self.delta_time_h}_{safe}.parquet"
             )
             tmp_path = self.temp_dir / tmp_fname
             save_compressed(matrix, tmp_path)
+
             if verbose:
                 size_mb = tmp_path.stat().st_size / 1e6
-                print(f"  Written temp file: {tmp_path.name} ({size_mb:.1f} MB)")
+                print(f"  {tmp_path.name} ({size_mb:.1f} MB)")
 
-            # ── 8. Upload to S3 ───────────────────────────────────────────
             s3_key = self._period_s3_key(period, kind)
             if verbose:
-                print(f"  Uploading to s3://{self.bucket}/{s3_key} …")
+                print(f"  → s3://{self.bucket}/{s3_key} …", end=" ", flush=True)
 
             ok = self._upload(tmp_path, s3_key)
             results[kind] = ok
 
             if ok:
-                cache[self._cache_key(period, kind)] = (
-                    f"s3://{self.bucket}/{s3_key}"
-                )
+                cache[self._cache_key(period, kind)] = f"s3://{self.bucket}/{s3_key}"
                 if verbose:
-                    print(f"  Upload OK.")
+                    print("OK")
             else:
-                # Keep temp file on failure so data is not lost
+                print(f"FAILED (temp file kept at {tmp_path})")
+
+        self._save_cache(cache)
+        self._clear_partial(period)   # remove checkpoint + partial counts
+        return results
+
+    # ------------------------------------------------------------------
+    # S3-progressive inner loop
+    # ------------------------------------------------------------------
+
+    def _run_s3_progressive(
+        self,
+        period: str,
+        force: bool = False,
+        verbose: bool = True,
+    ) -> tuple[pl.DataFrame | None, pl.DataFrame | None]:
+        """
+        Iterate over raw shards from S3 and accumulate counts for *period*.
+
+        Returns (acc_presence_counts, acc_transition_counts).
+        """
+        if verbose:
+            print(
+                f"\n[{period}] S3-progressive: "
+                f"s3://{self.raw_bucket}/{self.raw_s3_prefix}"
+            )
+
+        shard_keys = s3_list(
+            self.raw_bucket,
+            self.raw_s3_prefix,
+            self.raw_endpoint_url,
+            suffix=".parquet",
+        )
+        if not shard_keys:
+            print(
+                f"  WARNING: no .parquet shards at "
+                f"s3://{self.raw_bucket}/{self.raw_s3_prefix}"
+            )
+            return None, None
+
+        if verbose:
+            print(f"  {len(shard_keys)} raw shards found.")
+
+        completed = set() if force else self._load_shard_checkpoint(period)
+        pending   = [k for k in shard_keys if k not in completed]
+
+        if verbose:
+            print(
+                f"  Checkpoint: {len(completed)} done, {len(pending)} pending."
+            )
+
+        acc_pres  = None if force else self._load_partial(period, "presence")
+        acc_trans = None if force else self._load_partial(period, "transition")
+
+        if (acc_pres is not None or acc_trans is not None) and verbose:
+            print("  Resuming from partial accumulated counts.")
+
+        for idx, shard_key in enumerate(pending):
+            shard_name = Path(shard_key).name
+            tmp_shard  = self.temp_dir / f"_raw_{shard_name}"
+
+            if verbose:
                 print(
-                    f"  WARNING: upload failed — temp file kept at {tmp_path}."
+                    f"  [{idx + 1}/{len(pending)}] {shard_name} …",
+                    end=" ", flush=True,
                 )
 
-        # ── 9. Update cache ───────────────────────────────────────────────
-        self._save_cache(cache)
-        return results
+            ok = s3_download(
+                self.raw_bucket, shard_key, tmp_shard, self.raw_endpoint_url
+            )
+            if not ok:
+                print("download FAILED — skipping.")
+                continue
+
+            try:
+                df = pl.read_parquet(tmp_shard)
+                acc_pres, acc_trans = self._accumulate_shard(
+                    df, period, acc_pres, acc_trans
+                )
+                if verbose:
+                    print("done.")
+            except Exception as exc:
+                print(f"processing FAILED: {exc} — skipping.")
+            finally:
+                tmp_shard.unlink(missing_ok=True)
+
+            # Persist progress after every shard
+            completed.add(shard_key)
+            self._save_shard_checkpoint(period, completed)
+            if acc_pres is not None:
+                self._save_partial(period, "presence", acc_pres)
+            if acc_trans is not None:
+                self._save_partial(period, "transition", acc_trans)
+
+        if verbose:
+            n_p = acc_pres.height  if acc_pres  is not None else 0
+            n_t = acc_trans.height if acc_trans is not None else 0
+            print(
+                f"  Accumulated {n_p:,} presence rows "
+                f"and {n_t:,} transition rows."
+            )
+
+        return acc_pres, acc_trans
+
+    # ------------------------------------------------------------------
+    # Multi-period runner
+    # ------------------------------------------------------------------
 
     def run_all_periods(
         self,
         force: bool = False,
         verbose: bool = True,
     ) -> dict[str, dict[str, bool]]:
-        """
-        Run the pipeline for all periods in ``dataset.period_names``.
-
-        Parameters
-        ----------
-        force : bool
-            Re-compute even if cached.
-        verbose : bool
-
-        Returns
-        -------
-        dict[str, dict[str, bool]]
-            ``{period: {"presence": bool, "transition": bool}}``
-        """
-        all_results = {}
+        """Run the pipeline for all periods in ``dataset.period_names``."""
+        all_results: dict[str, dict[str, bool]] = {}
         for period in self.dataset.period_names:
             all_results[period] = self.run_period(
                 period, force=force, verbose=verbose
             )
         return all_results
 
-    def read_from_s3(
-        self,
-        period: str,
-        kind: str,
-    ) -> pl.DataFrame:
-        """
-        Download a computed matrix from S3 into a Polars DataFrame.
+    # ------------------------------------------------------------------
+    # Read back from S3
+    # ------------------------------------------------------------------
 
-        Parameters
-        ----------
-        period : str
-            Period name.
-        kind : str
-            ``"presence"`` or ``"transition"``.
-
-        Returns
-        -------
-        pl.DataFrame
-            The requested matrix, or an empty DataFrame if not found.
-        """
+    def read_from_s3(self, period: str, kind: str) -> pl.DataFrame:
+        """Download a computed matrix from S3 into a Polars DataFrame."""
         s3_key = self._period_s3_key(period, kind)
-        safe_period = period.replace(" ", "_").replace("/", "-")
-        tmp_path = self.temp_dir / f"_read_{kind}_{safe_period}.parquet"
-
-        result = subprocess.run(
-            [
-                "aws", "s3", "cp",
-                f"s3://{self.bucket}/{s3_key}",
-                str(tmp_path),
-                "--endpoint-url", self.endpoint_url,
-            ],
-            capture_output=True, text=True,
-        )
-
-        if result.returncode != 0 or not tmp_path.exists():
+        df = s3_read_parquet(self.bucket, s3_key, self.endpoint_url)
+        if df is None:
             print(f"  [read_from_s3] Not found: s3://{self.bucket}/{s3_key}")
             return pl.DataFrame()
-
-        df = pl.read_parquet(tmp_path)
-        tmp_path.unlink(missing_ok=True)
         return df
 
     # ------------------------------------------------------------------
-    # Info / diagnostics
+    # Diagnostics
     # ------------------------------------------------------------------
 
     def summary(self) -> None:
-        """Print the cache status and S3 prefix."""
+        """Print the pipeline configuration and S3 cache status."""
         cache = self._load_cache()
-        print(f"TransitionPipeline")
+        print("TransitionPipeline")
         print(f"  Region          : {getattr(self.dataset, 'id_', 'unknown')}")
         print(f"  Geohash prec.   : {self.geohash_precision}")
         print(f"  Delta time (h)  : {self.delta_time_h}")
-        print(f"  S3 prefix       : s3://{self.bucket}/{self.s3_prefix}")
+        print(f"  Output S3       : s3://{self.bucket}/{self.s3_prefix}")
+        if self.raw_bucket:
+            print(
+                f"  Raw S3 source   : "
+                f"s3://{self.raw_bucket}/{self.raw_s3_prefix}"
+            )
+        else:
+            print("  Raw source      : local files (dataset.dir_files)")
         print(f"  Computed entries: {len(cache)}")
-        for k, v in cache.items():
+        for k in cache:
             print(f"    ✓  {k}")
         if not cache:
             print("    (none — no computations recorded yet)")

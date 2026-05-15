@@ -1,0 +1,88 @@
+nohup: ignoring input
+────────────────────────────────────────────────────────────
+SECTION 1 · INPUT
+────────────────────────────────────────────────────────────
+Project root: /home/aamaduzzi/HumMobCov
+Output dir:   /home/aamaduzzi/HumMobCov/output
+Data dir:     /home/aamaduzzi/HumMobCov/data
+S3 endpoint:  https://s3.atlas.fbk.eu
+S3 bucket:    chub-datalake
+Out bucket:   chub-datalake
+
+Region:              CA
+Min points (np_):    20
+Time threshold (h):  1
+Output directory:    /home/aamaduzzi/HumMobCov/milestones_analysis/CA/dataxuser
+Number of raw files: 0
+
+Active feature flags:
+  ✓  raw_trajectories
+  ✓  is_radius_gyration
+  ✗  already_computed_rg
+  ✓  is_weekly_radius_gyration
+  ✓  is_gonzalez
+  ✗  already_computed_gonzalez
+  ✓  is_random_entropy
+  ✗  already_computed_random_entropy
+  ✓  is_uncorrelated_entropy
+  ✗  already_computed_uncorrelated_entropy
+  ✓  is_real_entropy
+  ✗  already_computed_real_entropy
+  ✓  is_distance
+  ✗  already_computed_distance
+  ✓  is_home
+  ✗  already_computed_home
+  ✓  is_krg
+  ✗  already_computed_krg
+  ✓  is_St
+  ✗  already_computed_St
+  ✓  is_fraction_time
+  ✗  already_computed_fraction_time
+  ✓  is_county_rural
+  ✗  already_computed_county_rural
+  ✓  is_frequency
+  ✗  already_computed_frequency
+  ✗  is_week2points
+  ✓  save_results
+
+Analysis periods:
+  15 jan - 15 march          2020-01-15  →  2020-03-15
+  15 march - 15 may          2020-03-15  →  2020-05-15
+  15 may - sept              2020-05-15  →  2020-09-30
+
+────────────────────────────────────────────────────────────
+SECTION 2 · MAIN
+────────────────────────────────────────────────────────────
+Periods already in store  : none
+Periods still to compute  : ['15 jan - 15 march', '15 march - 15 may', '15 may - sept']
+Compute path              : vectorized (polars)
+
+MODE B — S3 progressive download.
+  Input endpoint  : https://s3.atlas.fbk.eu
+  Input bucket    : chub-datalake
+  Input prefix    : shared/cuebiq/MOBS/urban_rural_flow_stops_cali_urban_rural_v3
+  Temp dir        : /home/aamaduzzi/HumMobCov/.shard_tmp
+  Output bucket   : chub-datalake
+  Output prefix   : final_pipeline/CA
+  Periods         : ['15 jan - 15 march', '15 march - 15 may', '15 may - sept']
+Listing shards at s3://chub-datalake/shared/cuebiq/MOBS/urban_rural_flow_stops_cali_urban_rural_v3 (recursive) …
+Shards — total: 54  completed: 25  pending: 29
+
+[1/29] Processing shared/cuebiq/MOBS/urban_rural_flow_stops_cali_urban_rural_v3/subset_32.snappy.parquet/part-00000-00542fcd-f9b7-4bc6-97c7-169a31f74714-c000.snappy.parquet …
+  Downloading from s3://chub-datalake/shared/cuebiq/MOBS/urban_rural_flow_stops_cali_urban_rural_v3/subset_32.snappy.parquet/part-00000-00542fcd-f9b7-4bc6-97c7-169a31f74714-c000.snappy.parquet …
+  [vectorized] Preprocessed 3 periods.
+  Period '15 jan - 15 march': 19,915 users …
+  Period '15 march - 15 may': 15,936 users …
+  [vectorized] Period '15 march - 15 may': 15,936 pending users
+  [compute] radius_of_gyration ... 0.2s
+  [compute] random_entropy ... 0.2s
+  [compute] uncorrelated_entropy ... 0.1s
+  [compute] real_entropy [LZ78] ... 4.6s
+  [compute] distance ... 0.2s
+  [compute] fraction_time ... 0.0s
+  [compute] home ... 0.1s
+  [compute] k_radius_of_gyration ... 0.8s
+  [timing] county_assignment: 0.1s
+  [timing] scalar metrics: 6.6s total
+  [compute] gonzalez ...gonzalez:   0%|          | 0/15936 [00:00<?, ?user/s]gonzalez:   3%|▎         | 422/15936 [00:00<00:03, 4213.55user/s]gonzalez:   6%|▌         | 975/15936 [00:00<00:03, 4986.91user/s]gonzalez:   9%|▉         | 1474/15936 [00:00<00:04, 3606.56user/s]gonzalez:  13%|█▎        | 2022/15936 [00:00<00:03, 4205.87user/s]gonzalez:  16%|█▌        | 2575/15936 [00:00<00:02, 4620.25user/s]gonzalez:  20%|█▉        | 3125/15936 [00:00<00:02, 4890.90user/s]gonzalez:  23%|██▎       | 3669/15936 [00:00<00:02, 5057.04user/s]gonzalez:  27%|██▋       | 4225/15936 [00:00<00:02, 5207.91user/s]gonzalez:  30%|███       | 4782/15936 [00:00<00:02, 5316.44user/s]gonzalez:  34%|███▎      | 5345/15936 [00:01<00:01, 5408.79user/s]gonzalez:  37%|███▋      | 5892/15936 [00:01<00:02, 3999.78user/s]gonzalez:  40%|████      | 6430/15936 [00:01<00:02, 4330.33user/s]gonzalez:  44%|████▎     | 6957/15936 [00:01<00:01, 4569.08user/s]gonzalez:  47%|████▋     | 7494/15936 [00:01<00:01, 4782.93user/s]gonzalez:  50%|█████     | 8033/15936 [00:01<00:01, 4950.59user/s]gonzalez:  54%|█████▍    | 8571/15936 [00:01<00:01, 5072.09user/s]gonzalez:  57%|█████▋    | 9108/15936 [00:01<00:01, 5157.23user/s]gonzalez:  61%|██████    | 9647/15936 [00:02<00:01, 5222.60user/s]gonzalez:  64%|██████▍   | 10178/15936 [00:02<00:01, 5096.00user/s]gonzalez:  67%|██████▋   | 10694/15936 [00:02<00:01, 3518.50user/s]gonzalez:  70%|███████   | 11200/15936 [00:02<00:01, 3831.94user/s]gonzalez:  73%|███████▎  | 11690/15936 [00:02<00:01, 4085.54user/s]gonzalez:  76%|███████▋  | 12167/15936 [00:02<00:00, 4258.19user/s]gonzalez:  79%|███████▉  | 12650/15936 [00:02<00:00, 4410.25user/s]gonzalez:  83%|████████▎ | 13163/15936 [00:02<00:00, 4606.71user/s]gonzalez:  86%|████████▌ | 13645/15936 [00:02<00:00, 4633.87user/s]gonzalez:  89%|████████▊ | 14124/15936 [00:03<00:00, 4649.26user/s]gonzalez:  92%|█████████▏| 14600/15936 [00:03<00:00, 4605.20user/s]gonzalez:  95%|█████████▍| 15068/15936 [00:03<00:00, 4519.96user/s]gonzalez:  98%|█████████▊| 15567/15936 [00:03<00:00, 4652.68user/s]                                                                    3.6s
+  [compute] S(t) ...S(t):   0%|          | 0/15936 [00:00<?, ?user/s]S(t):   1%|          | 126/15936 [00:00<00:12, 1257.07user/s]S(t):   2%|▏         | 291/15936 [00:00<00:10, 1485.61user/s]S(t):   3%|▎         | 459/15936 [00:00<00:09, 1571.82user/s]S(t):   4%|▍         | 630/15936 [00:00<00:09, 1625.80user/s]S(t):   5%|▌         | 798/15936 [00:00<00:09, 1642.61user/s]S(t):   6%|▌         | 963/15936 [00:00<00:09, 1582.88user/s]S(t):   7%|▋         | 1122/15936 [00:00<00:09, 1484.00user/s]S(t):   8%|▊         | 1272/15936 [00:00<00:10, 1367.58user/s]S(t):   9%|▉         | 1411/15936 [00:00<00:10, 1330.91user/s]S(t):  10%|▉         | 1546/15936 [00:01<00:11, 1302.35user/s]S(t):  11%|█         | 1678/15936 [00:01<00:11, 1286.69user/s]S(t):  11%|█▏        | 1808/15936 [00:01<00:11, 1221.16user/s]S(t):  12%|█▏        | 1931/15936 [00:01<00:11, 1212.17user/s]S(t):  13%|█▎        | 2053/15936 [00:01<00:11, 1192.45user/s]S(t):  14%|█▎        | 2175/15936 [00:01<00:11, 1199.06user/s]S(t):  14%|█▍        | 2301/15936 [00:01<00:11, 1216.07user/s]S(t):  15%|█▌        | 2423/15936 [00:01<00:11, 1214.88user/s]S(t):  16%|█▌        | 2545/15936 [00:01<00:11, 1210.23user/s]S(t):  17%|█▋        | 2671/15936 [00:02<00:10, 1224.05user/s]S(t):  18%|█▊        | 2798/15936 [00:02<00:10, 1237.05user/s]S(t):  18%|█▊        | 2922/15936 [00:02<00:10, 1233.41user/s]S(t):  19%|█▉        | 3046/15936 [00:02<00:10, 1219.60user/s]S(t):  20%|█▉        | 3169/15936 [00:02<00:10, 1206.96user/s]S(t):  21%|██        | 3290/15936 [00:02<00:10, 1202.90user/s]S(t):  21%|██▏       | 3411/15936 [00:02<00:10, 1193.83user/s]S(t):  22%|██▏       | 3533/15936 [00:02<00:10, 1200.45user/s]S(t):  23%|██▎       | 3655/15936 [00:02<00:10, 1206.03user/s]S(t):  24%|██▎       | 3778/15936 [00:02<00:10, 1211.54user/s]S(t):  24%|██▍       | 3900/15936 [00:03<00:09, 1208.34user/s]S(t):  25%|██▌       | 4022/15936 [00:03<00:09, 1211.68user/s]S(t):  26%|██▌       | 4144/15936 [00:03<00:10, 1152.34user/s]S(t):  27%|██▋       | 4260/15936 [00:03<00:10, 1151.17user/s]S(t):  28%|██▊       | 4387/15936 [00:03<00:09, 1184.14user/s]S(t):  28%|██▊       | 4512/15936 [00:03<00:09, 1201.42user/s]S(t):  29%|██▉       | 4635/15936 [00:03<00:09, 1209.77user/s]S(t):  30%|██▉       | 4757/15936 [00:03<00:09, 1196.58user/s]S(t):  31%|███       | 4880/15936 [00:03<00:09, 1204.41user/s]S(t):  31%|███▏      | 5006/15936 [00:03<00:08, 1219.38user/s]S(t):  32%|███▏      | 5130/15936 [00:04<00:08, 1225.17user/s]S(t):  33%|███▎      | 5253/15936 [00:04<00:08, 1226.59user/s]S(t):  34%|███▎      | 5377/15936 [00:04<00:08, 1230.39user/s]S(t):  35%|███▍      | 5501/15936 [00:04<00:08, 1213.30user/s]S(t):  35%|███▌      | 5623/15936 [00:04<00:08, 1214.08user/s]S(t):  36%|███▌      | 5755/15936 [00:04<00:08, 1244.13user/s]S(t):  37%|███▋      | 5888/15936 [00:04<00:07, 1268.61user/s]S(t):  38%|███▊      | 6015/15936 [00:04<00:08, 1217.73user/s]S(t):  39%|███▊      | 6138/15936 [00:04<00:08, 1140.75user/s]S(t):  39%|███▉      | 6260/15936 [00:05<00:08, 1162.33user/s]S(t):  40%|████      | 6380/15936 [00:05<00:08, 1172.99user/s]S(t):  41%|████      | 6505/15936 [00:05<00:07, 1194.26user/s]S(t):  42%|████▏     | 6626/15936 [00:05<00:07, 1193.34user/s]S(t):  42%|████▏     | 6746/15936 [00:05<00:07, 1181.83user/s]S(t):  43%|████▎     | 6866/15936 [00:05<00:07, 1186.38user/s]S(t):  44%|████▍     | 6993/15936 [00:05<00:07, 1208.98user/s]S(t):  45%|████▍     | 7119/15936 [00:05<00:07, 1223.47user/s]S(t):  45%|████▌     | 7245/15936 [00:05<00:07, 1233.39user/s]S(t):  46%|████▌     | 7369/15936 [00:05<00:07, 1219.47user/s]S(t):  47%|████▋     | 7492/15936 [00:06<00:07, 1064.54user/s]S(t):  48%|████▊     | 7610/15936 [00:06<00:07, 1094.54user/s]S(t):  49%|████▊     | 7732/15936 [00:06<00:07, 1127.51user/s]S(t):  49%|████▉     | 7847/15936 [00:06<00:07, 1132.30user/s]S(t):  50%|████▉     | 7962/15936 [00:06<00:07, 1112.94user/s]S(t):  51%|█████     | 8079/15936 [00:06<00:06, 1128.28user/s]S(t):  51%|█████▏    | 8193/15936 [00:06<00:06, 1128.65user/s]S(t):  52%|█████▏    | 8312/15936 [00:06<00:06, 1145.23user/s]S(t):  53%|█████▎    | 8430/15936 [00:06<00:06, 1155.37user/s]S(t):  54%|█████▎    | 8550/15936 [00:06<00:06, 1168.06user/s]S(t):  54%|█████▍    | 8673/15936 [00:07<00:06, 1185.43user/s]S(t):  55%|█████▌    | 8799/15936 [00:07<00:05, 1207.62user/s]S(t):  56%|█████▌    | 8920/15936 [00:07<00:05, 1193.49user/s]S(t):  57%|█████▋    | 9045/15936 [00:07<00:05, 1151.88user/s]S(t):  58%|█████▊    | 9171/15936 [00:07<00:05, 1181.73user/s]S(t):  59%|█████▊    | 9328/15936 [00:07<00:05, 1294.01user/s]S(t):  60%|█████▉    | 9487/15936 [00:07<00:04, 1378.53user/s]S(t):  60%|██████    | 9627/15936 [00:07<00:04, 1384.81user/s]S(t):  62%|██████▏   | 9801/15936 [00:07<00:04, 1488.75user/s]S(t):  63%|██████▎   | 9976/15936 [00:08<00:03, 1564.29user/s]S(t):  64%|██████▎   | 10149/15936 [00:08<00:03, 1613.63user/s]S(t):  65%|██████▍   | 10315/15936 [00:08<00:03, 1624.58user/s]S(t):  66%|██████▌   | 10490/15936 [00:08<00:03, 1660.02user/s]S(t):  67%|██████▋   | 10662/15936 [00:08<00:03, 1675.36user/s]S(t):  68%|██████▊   | 10839/15936 [00:08<00:02, 1701.02user/s]S(t):  69%|██████▉   | 11010/15936 [00:08<00:02, 1694.44user/s]S(t):  70%|███████   | 11180/15936 [00:08<00:02, 1693.17user/s]S(t):  71%|███████   | 11350/15936 [00:08<00:02, 1678.58user/s]S(t):  72%|███████▏  | 11518/15936 [00:08<00:02, 1646.33user/s]S(t):  73%|███████▎  | 11683/15936 [00:09<00:02, 1600.50user/s]S(t):  74%|███████▍  | 11844/15936 [00:09<00:02, 1454.59user/s]S(t):  75%|███████▌  | 12015/15936 [00:09<00:02, 1524.06user/s]

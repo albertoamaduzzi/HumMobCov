@@ -1,4 +1,6 @@
 \documentclass[main.tex]{subfiles}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
 \begin{document}
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -110,7 +112,7 @@ This is a weighted directed graph where the nodes (n) are the stop points, while
 \subsection*{Data}
 \label{dataset}
 
-Cuebiq Inc. provided the human mobility data used here for research purposes. This data was collected from anonymous mobile phone users who have opted-in to give access to their location data anonymously, through a GDPRcompliant framework. Researchers queried the mobility data through an auditable, cloud-hosted sandbox environment, receiving aggregate outputs in return. The datasets contain records of people living in California and Massachusetts from January 2021 to the end of September 2021. The former dataset is described in Tab.\ref{tabPeopleCal} total, we have over 17.8 billion. Given the unique nature of the data used in this study (enhanced mobile phone data collected by Cuebic, characterized by concentrated bursts of data collection within short time windows), it was necessary to implement a burst filtering process in order to ensure consistency in the acquisition of positional data. Specifically, the filter imposes that $\forall traj_{\alpha} \in Trajs, \forall sp_{t_{\tau}},sp_{t_{\tau + 1}} \in traj_{\alpha} $ that $t_{\tau + 1} - t_{\tau} > t^{burst}$, that is, two successive stop points are futher apart in time of at least $t^{burst}$. In this discussion, $t^{burst} = 1$ hour; however, alternative threshold values of 8 and 24 hours were also applied and are available in the Appendix for reference. We note here that the duration time $\delta t_{t_{\tau}}$ for a stop point is not the time between two successive stop points $sp_{t_{\tau}},sp_{t_{\tau + 1}}$ after the introduction of burst filter.
+Cuebiq Inc. provided the human mobility data used here for research purposes. This data was collected from anonymous mobile phone users who have opted-in to give access to their location data anonymously, through a GDPR-compliant framework. Researchers queried the mobility data through an auditable, cloud-hosted sandbox environment, receiving aggregate outputs in return. The datasets contain records of people living in California and Massachusetts from January 2020 to the end of September 2020. The former dataset is described in Tab.\ref{tabPeopleCal}. Given the unique nature of the data used in this study (enhanced mobile phone data collected by Cuebiq, characterized by concentrated bursts of data collection within short time windows), it was necessary to implement a burst filtering process in order to ensure consistency in the acquisition of positional data. Specifically, the filter imposes that $\forall traj_{\alpha} \in Trajs, \forall sp_{t_{\tau}},sp_{t_{\tau + 1}} \in traj_{\alpha} $ that $t_{\tau + 1} - t_{\tau} > t^{burst}$, that is, two successive stop points are further apart in time by at least $t^{burst}$. In this discussion, $t^{burst} = 1$ hour; however, alternative threshold values of 8 and 24 hours were also applied and are available in the Appendix for reference. We note here that the duration time $\delta t_{t_{\tau}}$ for a stop point is not the time between two successive stop points $sp_{t_{\tau}},sp_{t_{\tau + 1}}$ after the introduction of the burst filter.
 
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -119,58 +121,73 @@ Cuebiq Inc. provided the human mobility data used here for research purposes. Th
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 \subsection*{Metrics}
 
-We examine various measures that emphasize distinct types of comprehension, including geometric, information-theoretic, and visitation patterns. For starters, we have used a modified version of the radius of gyration and shown in \ref{rg}. This measures the radius within which a person is most probable to be found from the center of mass at time t. The essential modification is that each stop point is weighted by the time of stay. So the biggest is the stay, the biggest is the contribution to the radius, as can be seen in (fig. \ref{rg}).
+We examine various measures that emphasize distinct types of comprehension, including geometric, information-theoretic, and visitation patterns. For starters, we have used a modified version of the radius of gyration, shown in Eq.~\ref{rg}. This measures the spatial spread of a person's trajectory around its time-weighted centre of mass: the longer a user dwells at a location, the greater its contribution to the centroid and hence to the radius. The time-weighted centre of mass $\Vec{x^{\alpha}_{cm}}$ is defined as
 %
 \begin{equation}
-     R^{\alpha}_{g} = \sqrt{\frac{1}{|T^{\alpha}|} \sum_{t=0}^{t_{N^{\alpha}}}d_{g}(\Vec{x^{\alpha}_{t}},\Vec{x^{\alpha}_{cm,t}})^2\delta t_{t}}
+    \Vec{x^{\alpha}_{cm}} = \frac{\sum_{t \in T^{\alpha}} \delta t_{t}\, \Vec{x^{\alpha}_{t}}}{\sum_{t \in T^{\alpha}} \delta t_{t}},
+    \label{cm}
+\end{equation}
+%
+and the radius of gyration is then
+%
+\begin{equation}
+     R^{\alpha}_{g} = \sqrt{\frac{\displaystyle\sum_{t \in T^{\alpha}} \delta t_{t}\; d_{g}(\Vec{x^{\alpha}_{t}},\Vec{x^{\alpha}_{cm}})^2}{\displaystyle\sum_{t \in T^{\alpha}} \delta t_{t}}}
      \label{rg}
 \end{equation}
 %
-where $|T^{\alpha}|$ is the total time duration of the trajectory for person $\alpha$, $\delta t_{t}$ is the time spent at stop point of coordinates $\Vec{x_{t}}$ and $\Vec{x^{\alpha}_{cm,t}}$ is the center of mass for the trajectory up to time t.  The distance straight line is the geodesic distance on the earth. Another quantity that expresses geometric information is the distribution of stop points in trajectories in their intrinsic reference frame re-scaled by the variances on the principal axis. The procedure to calculate such quantity is shown in (alg.\ref{phi}). 
+where $\delta t_{t}$ is the time spent at the stop point of coordinates $\Vec{x^{\alpha}_{t}}$, $\Vec{x^{\alpha}_{cm}}$ is the time-weighted centre of mass of the full trajectory (Eq.~\ref{cm}), and $d_{g}$ is the geodesic distance projected onto the local tangent plane. All distances are expressed in kilometres. The centre of mass is computed once over the entire observation period for each user--period pair; it is not updated incrementally as new stops are observed. Another quantity that expresses geometric information is the distribution of stop points in trajectories in their intrinsic reference frame, re-scaled by the variances on the principal axes \cite{radius_gyration}. For each user $\alpha$, the procedure is:
 %
-\begin{equation}
-    $\bold{for}$ i in people\\
-    {
-    \{$x_i^\alpha \gets lat_i^\alpha$;\\
-    $y_i^\alpha \gets lon_i^\alpha$;\\
-    $I_{i(xy)} \gets $ inertia tensor;\\
-    $diag(I_{i(xy)}) \gets O_i^{-1}I_{i(xy)}O_i$;\\
-    $(x_i^{'\alpha},y_i^{'\alpha}) \gets O_i(x_i^{\alpha},y_i^{\alpha})$;\\
-    $(\sigma_{x'i},\sigma_{y'i}) \gets \sum_{\alpha}{(x_i^{'\alpha}-x'_{icm})^2 + (y_i^{'\alpha}-y'_{icm})^2}$
-    \}\\
-    Calculate probability distribution on $(\frac{x_i'}{\sigma_{xi}'},\frac{y_i'}{\sigma_{yi}'})$
-    }
-    \caption{Calculation distribution of positions in intrinsic reference frame}\label{phi}
-\end{equation}
+\begin{enumerate}
+    \item Project all stop coordinates to a local tangent plane centred at the trajectory's mean position, yielding $(x_t^{\alpha}, y_t^{\alpha})$ in metres.
+    \item Centre the point cloud: $\tilde{x}_t = x_t^{\alpha} - \bar{x}^{\alpha}$, $\tilde{y}_t = y_t^{\alpha} - \bar{y}^{\alpha}$.
+    \item Compute the second-moment (inertia) tensor:
+    \[
+        I_{xx} = \sum_t \tilde{x}_t^2,\quad
+        I_{yy} = \sum_t \tilde{y}_t^2,\quad
+        I_{xy} = \sum_t \tilde{x}_t\tilde{y}_t.
+    \]
+    \item Find the principal rotation angle $\theta$ that diagonalises the tensor:
+    \[
+        \mu = \sqrt{4I_{xy}^2 + (I_{xx}-I_{yy})^2}, \qquad
+        \cos\theta = \frac{-I_{xy}}{\left(\frac{I_{xx}-I_{yy}+\mu}{2}\right)
+                      \sqrt{1 + \frac{I_{xy}^2}{\left(\frac{I_{xx}-I_{yy}+\mu}{2}\right)^2}}}.
+    \]
+    \item Rotate to the principal frame: $(x'_t, y'_t) = R_\theta\,(\tilde{x}_t, \tilde{y}_t)$.
+    \item Compute the root-mean-square spreads: $\sigma_{x'} = \sqrt{\langle x'^2\rangle}$, $\sigma_{y'} = \sqrt{\langle y'^2\rangle}$.
+    \item Normalise: $\hat{x}_t = x'_t/\sigma_{x'}$, $\hat{y}_t = y'_t/\sigma_{y'}$.
+\end{enumerate}
+%
+The resulting 2D probability distribution on $(\hat{x},\hat{y})$ is the Gonzalez trajectory shape, which is independent of the trajectory's overall size and orientation.
+\label{phi}
 %
 We also measured the curve of newly visited places in time and the average frequency of the ten most frequented places per person, shown in figure \ref{visitation increase-frequency}.
-Let be $r$ denote the ranking $r = 1,...,10$. The latter case refers to the formula \ref{k_avg}.
+Let $r$ denote the rank $r = 1,\ldots,10$. The normalised visit frequency at rank $r$ in period $p$ is given by Eq.~\ref{k_avg}.
 %
 \begin{equation}
-    \langle k \rangle^{r,p} =  \langle \frac{k^{\alpha,r}}{\sum_{r = 1}^{min(10,r_{max})}k^{\alpha,r}} \rangle_{{\alpha} \in {trajs^p}}
+    \langle k \rangle^{r,p} =  \left\langle \frac{k^{\alpha,r}}{\sum_{r' = 1}^{\min(10,\,r_{\max})}k^{\alpha,r'}} \right\rangle_{{\alpha} \in {Trajs^p}}
     \label{k_avg}
 \end{equation}
 %
 Here, \( p \) denotes the time period, \( r \) represents the rank of a node in an individual’s mobility network (with \( r = 1 \) being the most visited location), and \( k^{\alpha, r} \) is the number of trips made by individual \( \alpha \) to the node of rank \( r \). The distribution is computed separately for each period \( p \), considering only the individuals active during that period.
 
 This metric captures how the frequency of visits to the most important locations changes across the population over different time periods.
-In the end, we calculated entropic measures that quantify the degree of uncertainty of the trajectories in three different ways: \ref{rdm_entropy} and \ref{unc_entropy}.
+In the end, we calculated entropic measures that quantify the degree of uncertainty of the trajectories in three different ways (Eqs.~\ref{rdm_entropy}--\ref{real_entropy}).
 %
 \begin{equation}
-    H_{random} = \log_2 n \label{rdm_entropy}
+    H_{\text{random}} = \log_2 n \label{rdm_entropy}
 \end{equation}
 %
 \begin{equation}
-    H_{uncorrelated} = -\sum_{i=1}^n p_i \log_2 p_i
+    H_{\text{uncorrelated}} = -\sum_{i=1}^n p_i \log_2 p_i
     \label{unc_entropy}
 \end{equation}
 %
 \begin{equation}
-H_{Real} = (\frac{1}{T}\sum_{t=1}^{T} \Lambda_t)^{-1} \log_2 T
+    H_{\text{real}} = \left(\frac{1}{T}\sum_{t=1}^{T} \Lambda_t\right)^{-1} \log_2 T
     \label{real_entropy}
 \end{equation}
 %
-The Random entropy, which depends on the number of visited places, the Shannon, which adds the dependency on the relative frequency of visits, assuming subsequent visits are independent, and eventually Lempel-Ziv estimation (Real entropy), which also considers the order in which visits are done. In particular, Lempel-Ziv provide data compression algorithm and an estimator that converges to the real entropy of a time series. $\Lambda$i is the length of the shortest substring (succession of stop points) starting at position t which doesn't previously appear from position 1 to t - 1  \cite{Lempel-Ziv}. These different measures allow a progressively finer view of the trajectories, adding different aspects that contribute to the description of the complexity of a single path. The k-radius of gyration is instead the radius of gyration that considers just the k-most visited places in the computation.
+The random entropy (Eq.~\ref{rdm_entropy}) depends only on the number $n$ of distinct visited locations. The uncorrelated entropy (Eq.~\ref{unc_entropy}) adds sensitivity to the relative frequency of visits $p_i$, treating successive stops as independent. The real entropy (Eq.~\ref{real_entropy}) is a Lempel-Ziv-78 estimator that accounts for the sequential order of visits and converges to the true entropy rate of the trajectory \cite{Lempel-Ziv, entropic_measures}. Here $T$ is the total number of stop points and $\Lambda_t$ is the length of the shortest substring starting at position $t$ that has not previously appeared in positions $1, \ldots, t-1$. These three measures provide a progressively finer view of trajectory complexity. The $k$-radius of gyration extends Eq.~\ref{rg} by restricting the computation to the $k$ most-visited locations (by visit count), capturing how much of a user's mobility is concentrated near their habitual places.
 
 
 

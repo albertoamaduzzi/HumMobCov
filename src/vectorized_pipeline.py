@@ -366,9 +366,17 @@ def preprocess_shard_polars(
     df = df.group_by("userId").map_groups(_apply_filter)
     df = df.drop("_time_diff_h")
 
-    # -- 5. Add stop-duration column (minutes)
+    # -- 5. Add stop-duration column (minutes).
+    #       Clamp to >= 0: raw data can have end < begin (clock drift /
+    #       data-quality issues).  Negative dur_min would corrupt the
+    #       time-weighted centroid in _compute_radius_of_gyration_polars,
+    #       causing sum(dur_min) ≈ 0 and RG values of 10^6+ km.
     df = df.with_columns(
-        (pl.col("end") - pl.col("begin")).dt.total_minutes().cast(pl.Float64).alias("dur_min")
+        (pl.col("end") - pl.col("begin"))
+        .dt.total_minutes()
+        .cast(pl.Float64)
+        .clip(lower_bound=0.0)
+        .alias("dur_min")
     )
 
     # -- 6. Split by period and filter by min points

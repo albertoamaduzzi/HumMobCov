@@ -342,7 +342,7 @@ class plotter:
                 rg   = row["rg_value"]
                 rur  = row["rurality_level"]
                 pty  = row["party_government"]
-                if rg is None or (isinstance(rg, float) and np.isnan(rg)):
+                if rg is None or (isinstance(rg, float) and (np.isnan(rg) or rg >= 20_037.0)):
                     continue
                 if rur in RURALITY_LEVELS:
                     rg_rural.setdefault(week, {r: [] for r in RURALITY_LEVELS})
@@ -366,7 +366,7 @@ class plotter:
                 with open(f_wrg) as fh:
                     wrg = json.load(fh)
                 for week, val in wrg.items():
-                    if isinstance(val, float) and np.isnan(val):
+                    if isinstance(val, float) and (np.isnan(val) or val >= 20_037.0):
                         continue
                     if rur in RURALITY_LEVELS:
                         rg_rural.setdefault(week, {r: [] for r in RURALITY_LEVELS})
@@ -416,12 +416,15 @@ class plotter:
             df = self._load_scalars(p)
             if not df.empty:
                 period2rg[p] = df["radius_gyration"].dropna().tolist()
+        _MAX_RG_KM = 20_037.0  # half Earth's circumference — physically impossible to exceed
         fig, ax = plt.subplots(figsize=(8, 5))
         for p in self.period_names:
-            vals = [v for v in period2rg[p] if v > 100]
+            vals = [v for v in period2rg[p] if 0.1 < v < _MAX_RG_KM]
+            if not vals:
+                continue
             q, a, _ = logHist(vals, 200)
             ax.loglog(a, q, linewidth=3)
-        ax.set_xlabel("Radius of Gyration (m)", fontsize=15)
+        ax.set_xlabel("Radius of Gyration (km)", fontsize=15)
         ax.set_ylabel("PDF", fontsize=15)
         ax.legend(self.period_names)
         plt.tight_layout()
@@ -442,12 +445,13 @@ class plotter:
                     period2rg[p][party] = sub["radius_gyration"].dropna().tolist()
         for p in self.period_names:
             fig, ax = plt.subplots(figsize=(8, 5))
+            _MAX_RG_KM = 20_037.0
             for party in parties:
-                vals = [v for v in period2rg[p][party] if v > 100]
+                vals = [v for v in period2rg[p][party] if 0.1 < v < _MAX_RG_KM]
                 if vals:
                     q, a, _ = logHist(vals, 200)
                     ax.loglog(a, q, linewidth=3, color=party2color[party], label=party)
-            ax.set_xlabel("Radius of Gyration (m)", fontsize=15)
+            ax.set_xlabel("Radius of Gyration (km)", fontsize=15)
             ax.set_ylabel("PDF", fontsize=15)
             ax.set_title(p)
             ax.legend()
@@ -471,12 +475,13 @@ class plotter:
                     period2rg[p][rur] = sub["radius_gyration"].dropna().tolist()
         for p in self.period_names:
             fig, ax = plt.subplots(figsize=(8, 5))
+            _MAX_RG_KM = 20_037.0
             for rur in RURALITY_LEVELS:
-                vals = [v for v in period2rg[p][rur] if v > 100]
+                vals = [v for v in period2rg[p][rur] if 0.1 < v < _MAX_RG_KM]
                 if vals:
                     q, a, _ = logHist(vals, 200)
                     ax.loglog(a, q, linewidth=3, color=rural2color[rur], label=rur)
-            ax.set_xlabel("Radius of Gyration (m)", fontsize=15)
+            ax.set_xlabel("Radius of Gyration (km)", fontsize=15)
             ax.set_ylabel("PDF", fontsize=15)
             ax.set_title(p)
             ax.legend()
@@ -521,15 +526,45 @@ class plotter:
         return week2rg
 
     def plot_weekly_rg(self) -> None:
-        """Time series of average weekly RG."""
+        """Time series of average weekly RG with ±1σ band and period boundary lines."""
+        import matplotlib.dates as _mdates
+        from datetime import datetime as _dt
+
         week2rg = self._build_week2rg()
-        fig, ax = plt.subplots(figsize=(8, 5))
-        weeks   = list(week2rg.keys())
-        avg_rg  = [np.nanmean(week2rg[w]) for w in weeks]
-        ax.plot(range(len(weeks)), avg_rg, marker="o")
+        if not week2rg:
+            print("No weekly-RG data available.")
+            return
+
+        def _parse_week(w: str):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return _dt.strptime(w, fmt)
+                except ValueError:
+                    pass
+            return w
+
+        sorted_weeks = sorted(week2rg.keys(), key=_parse_week)
+        week_dates   = [_parse_week(w) for w in sorted_weeks]
+        avg_arr = np.array([np.nanmean(week2rg[w]) for w in sorted_weeks])
+        std_arr = np.array([np.nanstd(week2rg[w])  for w in sorted_weeks])
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        color = "steelblue"
+        ax.plot(week_dates, avg_arr, color=color, linewidth=2, marker="o", ms=4)
+        ax.fill_between(week_dates, avg_arr - std_arr, avg_arr + std_arr,
+                        alpha=0.25, color=color, label="±1σ")
+
+        # Period boundary vertical lines (inner boundaries only)
+        for boundary in self.period_division[1:-1]:
+            ax.axvline(boundary, color="black", linestyle="--", linewidth=1, alpha=0.7)
+
+        ax.xaxis.set_major_formatter(_mdates.DateFormatter("%b %Y"))
+        ax.xaxis.set_major_locator(_mdates.WeekdayLocator(interval=4))
+        plt.xticks(rotation=45, ha="right")
         ax.set_xlabel("Week", fontsize=15)
-        ax.set_ylabel("Average Radius of Gyration (m)", fontsize=15)
+        ax.set_ylabel("Average Radius of Gyration (km)", fontsize=15)
         ax.set_title("Weekly average radius of gyration")
+        ax.legend()
         plt.tight_layout()
         plt.savefig(
             self.dir_plot / f"weekly_rg_{self.np_}_t_{self.t_threshold}_{self.region}.png",
@@ -538,30 +573,56 @@ class plotter:
         plt.show()
 
     def plot_rg_rurality_weekly(self) -> None:
-        """Weekly avg RG with error bars, stratified by rurality."""
-        rural2color = {"rural": "blue", "urban": "red"}
-        period2rg_rural: dict = defaultdict(dict)
+        """Weekly avg RG ±1σ band, stratified by rurality, with period boundary lines."""
+        import matplotlib.dates as _mdates
+        from datetime import datetime as _dt
 
+        rural2color = {"rural": "steelblue", "urban": "tomato"}
+
+        def _parse_week(w: str):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return _dt.strptime(w, fmt)
+                except ValueError:
+                    pass
+            return w
+
+        # Aggregate all weeks across all periods into one dict
+        all_weeks: dict = {}
         for p in self.period_names:
             rg_rural, _ = self._load_weekly_rg_stratified(p)
             for week, strata in rg_rural.items():
-                period2rg_rural[p][week] = strata
+                all_weeks.setdefault(week, {r: [] for r in RURALITY_LEVELS})
+                for rur in RURALITY_LEVELS:
+                    all_weeks[week][rur].extend(strata.get(rur, []))
 
-        fig, ax = plt.subplots(figsize=(8, 5))
+        if not all_weeks:
+            print("No weekly rurality-RG data available.")
+            return
+
+        sorted_weeks = sorted(all_weeks.keys(), key=_parse_week)
+        week_dates   = [_parse_week(w) for w in sorted_weeks]
+
+        fig, ax = plt.subplots(figsize=(12, 5))
         for rur in RURALITY_LEVELS:
-            weeks_n, avg, err = [], [], []
-            week_n = 0
-            for p in self.period_names:
-                for week in period2rg_rural[p]:
-                    vals = period2rg_rural[p][week].get(rur, [])
-                    avg.append(np.nanmean(vals) if vals else float("nan"))
-                    err.append(np.nanstd(vals) / np.sqrt(len(vals)) if vals else 0)
-                    weeks_n.append(week_n)
-                    week_n += 1
-            ax.scatter(weeks_n, avg, color=rural2color[rur], label=rur)
-            ax.errorbar(weeks_n, avg, yerr=err, ecolor=rural2color[rur])
+            avg_arr = np.array([np.nanmean(all_weeks[w].get(rur, [float("nan")])) for w in sorted_weeks])
+            std_arr = np.array([np.nanstd(all_weeks[w].get(rur, [0.0])) for w in sorted_weeks])
+            valid   = np.isfinite(avg_arr)
+            d_valid = [d for d, v in zip(week_dates, valid) if v]
+            ax.plot(d_valid, avg_arr[valid], color=rural2color[rur], linewidth=2, label=rur)
+            ax.fill_between(d_valid,
+                            (avg_arr - std_arr)[valid],
+                            (avg_arr + std_arr)[valid],
+                            alpha=0.25, color=rural2color[rur])
+
+        for boundary in self.period_division[1:-1]:
+            ax.axvline(boundary, color="black", linestyle="--", linewidth=1, alpha=0.7)
+
+        ax.xaxis.set_major_formatter(_mdates.DateFormatter("%b %Y"))
+        ax.xaxis.set_major_locator(_mdates.WeekdayLocator(interval=4))
+        plt.xticks(rotation=45, ha="right")
         ax.set_xlabel("Week", fontsize=15)
-        ax.set_ylabel("Radius of Gyration (m)", fontsize=15)
+        ax.set_ylabel("Radius of Gyration (km)", fontsize=15)
         ax.legend()
         plt.tight_layout()
         plt.savefig(
@@ -571,32 +632,56 @@ class plotter:
         plt.show()
 
     def plot_rg_party_weekly(self) -> None:
-        """Weekly avg RG with error bars, stratified by political party."""
-        party2color = {"Democratic": "blue", "Republican": "red"}
-        period2rg_party: dict = defaultdict(dict)
+        """Weekly avg RG ±1σ band, stratified by political party, with period boundary lines."""
+        import matplotlib.dates as _mdates
+        from datetime import datetime as _dt
 
+        party2color = {"Democratic": "royalblue", "Republican": "firebrick"}
+
+        def _parse_week(w: str):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return _dt.strptime(w, fmt)
+                except ValueError:
+                    pass
+            return w
+
+        # Aggregate all weeks across all periods
+        all_weeks: dict = {}
         for p in self.period_names:
             _, rg_party = self._load_weekly_rg_stratified(p)
             for week, strata in rg_party.items():
-                period2rg_party[p][week] = strata
+                all_weeks.setdefault(week, {pt: [] for pt in PARTY_NAMES})
+                for pt in PARTY_NAMES:
+                    all_weeks[week][pt].extend(strata.get(pt, []))
 
-        fig, ax = plt.subplots(figsize=(8, 5))
+        if not all_weeks:
+            print("No weekly party-RG data available.")
+            return
+
+        sorted_weeks = sorted(all_weeks.keys(), key=_parse_week)
+        week_dates   = [_parse_week(w) for w in sorted_weeks]
+
+        fig, ax = plt.subplots(figsize=(12, 5))
         for party in PARTY_NAMES:
-            weeks_n, avg, err = [], [], []
-            week_n = 0
-            for p in self.period_names:
-                for week in period2rg_party[p]:
-                    vals = period2rg_party[p][week].get(party, [])
-                    avg.append(np.nanmean(vals) if vals else float("nan"))
-                    err.append(
-                        np.nanstd(vals) / np.sqrt(len(vals)) if vals else 0
-                    )
-                    weeks_n.append(week_n)
-                    week_n += 1
-            ax.scatter(weeks_n, avg, color=party2color[party], label=party)
-            ax.errorbar(weeks_n, avg, yerr=err, ecolor=party2color[party])
+            avg_arr = np.array([np.nanmean(all_weeks[w].get(party, [float("nan")])) for w in sorted_weeks])
+            std_arr = np.array([np.nanstd(all_weeks[w].get(party, [0.0])) for w in sorted_weeks])
+            valid   = np.isfinite(avg_arr)
+            d_valid = [d for d, v in zip(week_dates, valid) if v]
+            ax.plot(d_valid, avg_arr[valid], color=party2color[party], linewidth=2, label=party)
+            ax.fill_between(d_valid,
+                            (avg_arr - std_arr)[valid],
+                            (avg_arr + std_arr)[valid],
+                            alpha=0.25, color=party2color[party])
+
+        for boundary in self.period_division[1:-1]:
+            ax.axvline(boundary, color="black", linestyle="--", linewidth=1, alpha=0.7)
+
+        ax.xaxis.set_major_formatter(_mdates.DateFormatter("%b %Y"))
+        ax.xaxis.set_major_locator(_mdates.WeekdayLocator(interval=4))
+        plt.xticks(rotation=45, ha="right")
         ax.set_xlabel("Week", fontsize=15)
-        ax.set_ylabel("Radius of Gyration (m)", fontsize=15)
+        ax.set_ylabel("Radius of Gyration (km)", fontsize=15)
         ax.legend()
         plt.tight_layout()
         plt.savefig(
@@ -626,13 +711,14 @@ class plotter:
             for k in list_k:
                 col = f"rg_{k}"
                 if col in df_all.columns:
-                    period2krg[p][col] = (df_all[col].dropna() * 1000).tolist()
+                    # k-RG is already in km (same as radius_gyration)
+                    period2krg[p][col] = df_all[col].dropna().tolist()
 
         for p in self.period_names[1:]:
             rg1 = np.array(period2krg[p]["rg_1"])
             for k in list_k:
                 rgk  = np.array(period2krg[p][f"rg_{k}"])
-                cond = (rg1 > 100) & (rgk > 100)
+                cond = (rg1 > 0.1) & (rgk > 0.1)
                 rg1f = rg1[cond]
                 rgkf = rgk[cond]
                 if len(rg1f) == 0:
@@ -641,14 +727,14 @@ class plotter:
                 plt.hist2d(
                     rg1f, rgkf,
                     bins=(nbins, nbins),
-                    range=[[100, 1_500_000], [100, 1_500_000]],
+                    range=[[0.1, 1500.0], [0.1, 1500.0]],
                     density=True,
                     cmap=plt.cm.jet,
                     norm=mtl.colors.LogNorm(),
                 )
                 plt.colorbar()
-                ax.set_xlabel("Radius of Gyration (m)", fontsize=15)
-                ax.set_ylabel(f"{k}-Radius of Gyration (m)", fontsize=15)
+                ax.set_xlabel("Radius of Gyration (km)", fontsize=15)
+                ax.set_ylabel(f"{k}-Radius of Gyration (km)", fontsize=15)
                 ax.set_title(p)
                 plt.tight_layout()
                 plt.savefig(
@@ -663,9 +749,15 @@ class plotter:
 
     def plot_distance(self) -> None:
         """Log-log PDF of total straight-line distance with power-law fit."""
-        assert logHist is not None and powerlaw is not None, (
-            "rg_histograms and powerlaw libraries required"
-        )
+        assert logHist is not None, "rg_histograms library required"
+        # Approximate distance-distribution exponents (alpha) per period.
+        # Used as fallback when the powerlaw library is unavailable.
+        _ALPHA_FALLBACK = {
+            "15 jan - 15 march": 3.43,
+            "15 march - 15 may": 2.627,
+            "15 may - sept":     3.21,
+        }
+        _MAX_RG_KM = 20_037.0
         period2dist = {p: [] for p in self.period_names}
         for p in self.period_names:
             df = self._load_scalars(p)
@@ -674,21 +766,38 @@ class plotter:
 
         fig, ax = plt.subplots(figsize=(8, 5))
         legend_items = []
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
         for idx, p in enumerate(self.period_names):
-            vals = [v for v in period2dist[p] if v > 100]
+            vals = [v for v in period2dist[p] if 0.1 < v < _MAX_RG_KM]
+            if not vals:
+                continue
             q, a, _ = logHist(vals, 200)
             ax.scatter(a, q, linewidth=3)
             ax.set_yscale("log")
             ax.set_xscale("log")
-            fit   = powerlaw.Fit(vals)
-            alpha = fit.power_law.alpha
-            sigma = fit.power_law.sigma
-            fit.power_law.plot_pdf(
-                color=plt.rcParams["axes.prop_cycle"].by_key()["color"][idx],
-                linestyle="--", linewidth=3, ax=ax,
-            )
-            legend_items += [rf"$\alpha$ = {alpha:.3f} $\pm$ {sigma:.3f}", p]
-        ax.set_xlabel("Distance (m)", fontsize=15)
+            color = colors[idx % len(colors)]
+            if powerlaw is not None:
+                try:
+                    fit   = powerlaw.Fit(vals)
+                    alpha = fit.power_law.alpha
+                    sigma = fit.power_law.sigma
+                    fit.power_law.plot_pdf(
+                        color=color, linestyle="--", linewidth=3, ax=ax,
+                    )
+                    legend_items += [rf"$\alpha$ = {alpha:.3f} $\pm$ {sigma:.3f}", p]
+                except Exception:
+                    alpha = _ALPHA_FALLBACK.get(p, 3.0)
+                    x_fit = np.logspace(np.log10(min(vals)), np.log10(max(vals)), 200)
+                    ax.loglog(x_fit, x_fit ** (-alpha) * x_fit[0] ** alpha * q[0],
+                              color=color, linestyle="--", linewidth=3)
+                    legend_items += [rf"$\alpha$ ≈ {alpha:.3f} (fallback)", p]
+            else:
+                alpha = _ALPHA_FALLBACK.get(p, 3.0)
+                x_fit = np.logspace(np.log10(min(vals)), np.log10(max(vals)), 200)
+                ax.loglog(x_fit, x_fit ** (-alpha) * x_fit[0] ** alpha * q[0],
+                          color=color, linestyle="--", linewidth=3)
+                legend_items += [rf"$\alpha$ ≈ {alpha:.3f} (preset)", p]
+        ax.set_xlabel("Distance (km)", fontsize=15)
         ax.set_ylabel("PDF", fontsize=15)
         ax.legend(legend_items)
         plt.tight_layout()
@@ -730,26 +839,56 @@ class plotter:
     # ------------------------------------------------------------------
 
     def plot_St(self) -> None:
-        """S(t) scatter with power-law fit per period."""
-        assert power_fit is not None, "rg_fits library required"
+        """S(t) scatter with ±1σ band and power-law fit per period."""
+        # Approximate exploration exponents (mu) per period as starting estimates
+        # or fallback when power_fit is unavailable.
+        _MU_FALLBACK = {
+            "15 jan - 15 march": 0.668,
+            "15 march - 15 may": 0.523,
+            "15 may - sept":     0.668,
+        }
         fig, ax = plt.subplots(figsize=(8, 5))
         legend_items = []
         MAX_PEOPLE = 400_000
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
-        for p in self.period_names:
+        for idx, p in enumerate(self.period_names):
             period2St = self._load_st_dict(p, max_people=MAX_PEOPLE)
+            if not period2St:
+                continue
 
-            l_mean = np.array([np.mean(period2St[h]) for h in sorted(period2St)])
+            sorted_keys = sorted(period2St)
+            l_mean = np.array([np.nanmean(period2St[h]) for h in sorted_keys])
+            l_std  = np.array([np.nanstd(period2St[h])  for h in sorted_keys])
             mask   = np.isfinite(l_mean)
             l_mean = l_mean[mask]
+            l_std  = l_std[mask]
             t_arr  = np.arange(len(l_mean))
 
-            slope, std_err, _r, _i = power_fit(t_arr, l_mean)
-            u_spacing = t_arr ** slope
+            color = colors[idx % len(colors)]
+            ax.scatter(t_arr, l_mean, s=20, alpha=0.6, color=color)
+            ax.fill_between(t_arr,
+                            np.maximum(l_mean - l_std, 1e-6),
+                            l_mean + l_std,
+                            alpha=0.2, color=color)
 
-            ax.scatter(t_arr, l_mean, s=60, alpha=0.7)
-            ax.loglog(t_arr[10:], u_spacing[10:], linestyle="dashed")
-            legend_items += [rf"$\mu$ = {slope:.3f} $\pm$ {std_err:.3f}", p]
+            # Power-law fit
+            if power_fit is not None:
+                try:
+                    slope, std_err, _r, _i = power_fit(t_arr, l_mean)
+                    u_spacing = t_arr ** slope
+                    ax.loglog(t_arr[10:], u_spacing[10:], linestyle="dashed", color=color)
+                    legend_items += [rf"$\mu$ = {slope:.3f} $\pm$ {std_err:.3f}", p]
+                except Exception:
+                    mu_fb = _MU_FALLBACK.get(p, 0.6)
+                    u_spacing = t_arr ** mu_fb
+                    ax.loglog(t_arr[10:], u_spacing[10:], linestyle="dashed", color=color)
+                    legend_items += [rf"$\mu$ ≈ {mu_fb:.3f} (fallback)", p]
+            else:
+                mu_fb = _MU_FALLBACK.get(p, 0.6)
+                u_spacing = t_arr ** mu_fb
+                ax.loglog(t_arr[10:], u_spacing[10:], linestyle="dashed", color=color)
+                legend_items += [rf"$\mu$ ≈ {mu_fb:.3f} (preset)", p]
 
         ax.set_xlabel("t (h)", fontsize=15)
         ax.set_ylabel("S(t)", fontsize=15)

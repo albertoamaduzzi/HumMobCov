@@ -44,7 +44,8 @@ The following metrics differ slightly from the old skmob-based ones:
 * **real_entropy**: same LZ78 algorithm as skmob, re-implemented in
   pure Python (called via ``map_groups``).
 
-* **distance**: mean inter-stop haversine distance, same as skmob.
+* **distance**: total haversine path length [km] (sum of inter-stop distances),
+  same as ``skmob.measures.individual.distance_straight_line``.
 
 * **k_radius_of_gyration**: same formula as skmob (top-k locations by
   visit count).
@@ -614,7 +615,8 @@ def _compute_home_polars(df: pl.DataFrame) -> pl.DataFrame:
 
 def _compute_distance_polars(df: pl.DataFrame) -> pl.DataFrame:
     """
-    Mean inter-stop haversine distance [km] for all users.
+    Total haversine path length [km] for all users (sum of inter-stop distances),
+    equivalent to ``skmob.measures.individual.distance_straight_line``.
 
     Returns [userId, distance].
     """
@@ -654,7 +656,7 @@ def _compute_distance_polars(df: pl.DataFrame) -> pl.DataFrame:
     )
 
     dist = pairs.group_by("userId").agg(
-        pl.col("step_km").mean().alias("distance")
+        pl.col("step_km").sum().alias("distance")
     )
     return dist
 

@@ -15,6 +15,15 @@ helper reads one parquet file per period instead of iterating over thousands
 of individual ``*.csv.gz`` files — dramatically faster for large datasets.
 The plotting logic (histogram / scatter / bar code) is unchanged; only the
 data-loading path switches.
+
+Plot-data caching
+-----------------
+Every plot method serialises the data it plots to a uniquely-named parquet
+file under ``<base>/plot_data/``.  On subsequent calls the method checks
+whether the cache file already exists; if so the expensive data-loading step
+is skipped entirely and the figure is produced straight from the cached
+dataframe.  Cache files have fully-descriptive names so they can also be
+inspected or reused outside of this class.
 """
 
 import os
@@ -24,6 +33,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pandas as pd
 import matplotlib as mtl
+import matplotlib.colors as _mcolors
 import matplotlib.pyplot as plt
 from pathlib import Path
 from collections import defaultdict
@@ -43,6 +53,7 @@ from .constants import (
     FNAME_WEEKLY_RG,
 )
 from .utils import ifnotexistsmkdir, get_already_saved_user_per_period
+from . import set_mpl
 
 if TYPE_CHECKING:
     from .store import ParquetStore
@@ -105,9 +116,12 @@ class plotter:
         self.df_rurality     = df_rurality
         self.store           = store
 
+        set_mpl.setup()
+
         base = Path(output_dir) if output_dir else DIR_MILESTONES_SERVER / region
-        self.dir_users  = ifnotexistsmkdir(base / "dataxuser")
-        self.dir_plot   = ifnotexistsmkdir(base / "plots")
+        self.dir_users     = ifnotexistsmkdir(base / "dataxuser")
+        self.dir_plot      = ifnotexistsmkdir(base / "plots")
+        self.dir_plot_data = ifnotexistsmkdir(base / "plot_data")
 
         # Checkpoint index: {period: {kind: [user_ids]}}
         # (only used in legacy mode — store mode uses parquet footer metadata)
@@ -119,6 +133,28 @@ class plotter:
         self.period2wrgusers_files = None
         self.period2frequencyusers = None
         self.period2Stusers        = None
+
+    # ------------------------------------------------------------------
+    # Plot-data cache helpers
+    # ------------------------------------------------------------------
+
+    def _cache_path(self, name: str) -> Path:
+        """Return the full path for a plot-data parquet cache file."""
+        return (
+            self.dir_plot_data
+            / f"{name}_np{self.np_}_t{self.t_threshold}_{self.region}.parquet"
+        )
+
+    def _load_cache(self, name: str) -> "pd.DataFrame | None":
+        """Return the cached dataframe, or *None* if the cache does not exist."""
+        p = self._cache_path(name)
+        if p.exists():
+            return pd.read_parquet(p)
+        return None
+
+    def _save_cache(self, df: pd.DataFrame, name: str) -> None:
+        """Write *df* to the plot-data cache for *name*."""
+        df.to_parquet(self._cache_path(name), index=False)
 
     # ------------------------------------------------------------------
     # File-list builders
@@ -411,85 +447,121 @@ class plotter:
     def plot_rg(self) -> None:
         """Log-log PDF of overall RG across the three periods."""
         assert logHist is not None, "rg_histograms library not available"
-        period2rg = {p: [] for p in self.period_names}
-        for p in self.period_names:
-            df = self._load_scalars(p)
-            if not df.empty:
-                period2rg[p] = df["radius_gyration"].dropna().tolist()
-        _MAX_RG_KM = 20_037.0  # half Earth's circumference — physically impossible to exceed
+        _MAX_RG_KM = 20_037.0
+
+        CACHE = "radius_gyration_distribution"
+        df = self._load_cache(CACHE)
+        if df is None:
+            rows = []
+            for p in self.period_names:
+                df_s = self._load_scalars(p)
+                if not df_s.empty:
+                    vals = pd.to_numeric(df_s["radius_gyration"], errors="coerce").dropna()
+                    vals = vals[(vals > 0.1) & (vals < _MAX_RG_KM)].tolist()
+                    if vals:
+                        q, a, _ = logHist(vals, 200)
+                        for bc, pv in zip(a, q):
+                            rows.append({"period": p, "bin_center": float(bc), "pdf": float(pv)})
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
         fig, ax = plt.subplots(figsize=(8, 5))
         for p in self.period_names:
-            vals = [v for v in period2rg[p] if 0.1 < v < _MAX_RG_KM]
-            if not vals:
+            sub = df[df["period"] == p].sort_values("bin_center")
+            if sub.empty:
                 continue
-            q, a, _ = logHist(vals, 200)
-            ax.loglog(a, q, linewidth=3)
-        ax.set_xlabel("Radius of Gyration (km)", fontsize=15)
-        ax.set_ylabel("PDF", fontsize=15)
-        ax.legend(self.period_names)
+            ax.loglog(sub["bin_center"], sub["pdf"], linewidth=set_mpl.LINEWIDTH)
+        ax.set_xlabel(r"$R_g$ (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.set_ylabel("PDF", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.legend(self.period_names, fontsize=set_mpl.FONTSIZE_LEGEND)
         plt.tight_layout()
-        plt.savefig(self.dir_plot / f"rg_{self.np_}_hour_{self.t_threshold}_{self.region}.png", dpi=200)
+        set_mpl.save(fig, self.dir_plot / f"rg_{self.np_}_hour_{self.t_threshold}_{self.region}.png")
         plt.show()
 
     def plot_rg_party_per_period(self) -> None:
         """RG distribution split by Democratic / Republican county, one subplot per period."""
         assert logHist is not None, "rg_histograms library not available"
-        parties = PARTY_NAMES
+        _MAX_RG_KM = 20_037.0
         party2color = {"Democratic": "blue", "Republican": "red"}
-        period2rg = {p: {party: [] for party in parties} for p in self.period_names}
-        for p in self.period_names:
-            df = self._load_scalars(p)
-            if not df.empty and "party_government" in df.columns:
-                for party in parties:
-                    sub = df[df["party_government"] == party]
-                    period2rg[p][party] = sub["radius_gyration"].dropna().tolist()
+
+        CACHE = "radius_gyration_by_party"
+        df = self._load_cache(CACHE)
+        if df is None:
+            rows = []
+            for p in self.period_names:
+                df_s = self._load_scalars(p)
+                if not df_s.empty and "party_government" in df_s.columns:
+                    for party in PARTY_NAMES:
+                        vals = pd.to_numeric(
+                            df_s.loc[df_s["party_government"] == party, "radius_gyration"],
+                            errors="coerce"
+                        ).dropna()
+                        vals = vals[(vals > 0.1) & (vals < _MAX_RG_KM)].tolist()
+                        if vals:
+                            q, a, _ = logHist(vals, 200)
+                            for bc, pv in zip(a, q):
+                                rows.append({"period": p, "party": party,
+                                             "bin_center": float(bc), "pdf": float(pv)})
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
         for p in self.period_names:
             fig, ax = plt.subplots(figsize=(8, 5))
-            _MAX_RG_KM = 20_037.0
-            for party in parties:
-                vals = [v for v in period2rg[p][party] if 0.1 < v < _MAX_RG_KM]
-                if vals:
-                    q, a, _ = logHist(vals, 200)
-                    ax.loglog(a, q, linewidth=3, color=party2color[party], label=party)
-            ax.set_xlabel("Radius of Gyration (km)", fontsize=15)
-            ax.set_ylabel("PDF", fontsize=15)
-            ax.set_title(p)
-            ax.legend()
+            for party in PARTY_NAMES:
+                sub = df[(df["period"] == p) & (df["party"] == party)].sort_values("bin_center")
+                if not sub.empty:
+                    ax.loglog(sub["bin_center"], sub["pdf"], linewidth=set_mpl.LINEWIDTH,
+                              color=party2color[party], label=party)
+            ax.set_xlabel(r"$R_g$ (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+            ax.set_ylabel("PDF", fontsize=set_mpl.FONTSIZE_LABEL)
+#            ax.set_title(p, fontsize=set_mpl.FONTSIZE_TITLE)
+            ax.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
             plt.tight_layout()
-            plt.savefig(
-                self.dir_plot / f"rg_party_{self.np_}_t_{self.t_threshold}_{self.region}_{p}.png",
-                dpi=200,
-            )
+            set_mpl.save(fig,
+                self.dir_plot / f"rg_party_{self.np_}_t_{self.t_threshold}_{self.region}_{p}.png")
             plt.show()
 
     def plot_rg_rurality_per_period(self) -> None:
         """RG distribution split by urban / rural county, one subplot per period."""
         assert logHist is not None, "rg_histograms library not available"
+        _MAX_RG_KM = 20_037.0
         rural2color = {"rural": "blue", "urban": "red"}
-        period2rg = {p: {r: [] for r in RURALITY_LEVELS} for p in self.period_names}
-        for p in self.period_names:
-            df = self._load_scalars(p)
-            if not df.empty and "rurality_level" in df.columns:
-                for rur in RURALITY_LEVELS:
-                    sub = df[df["rurality_level"] == rur]
-                    period2rg[p][rur] = sub["radius_gyration"].dropna().tolist()
+
+        CACHE = "radius_gyration_by_rurality"
+        df = self._load_cache(CACHE)
+        if df is None:
+            rows = []
+            for p in self.period_names:
+                df_s = self._load_scalars(p)
+                if not df_s.empty and "rurality_level" in df_s.columns:
+                    for rur in RURALITY_LEVELS:
+                        vals = pd.to_numeric(
+                            df_s.loc[df_s["rurality_level"] == rur, "radius_gyration"],
+                            errors="coerce"
+                        ).dropna()
+                        vals = vals[(vals > 0.1) & (vals < _MAX_RG_KM)].tolist()
+                        if vals:
+                            q, a, _ = logHist(vals, 200)
+                            for bc, pv in zip(a, q):
+                                rows.append({"period": p, "rurality": rur,
+                                             "bin_center": float(bc), "pdf": float(pv)})
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
         for p in self.period_names:
             fig, ax = plt.subplots(figsize=(8, 5))
-            _MAX_RG_KM = 20_037.0
             for rur in RURALITY_LEVELS:
-                vals = [v for v in period2rg[p][rur] if 0.1 < v < _MAX_RG_KM]
-                if vals:
-                    q, a, _ = logHist(vals, 200)
-                    ax.loglog(a, q, linewidth=3, color=rural2color[rur], label=rur)
-            ax.set_xlabel("Radius of Gyration (km)", fontsize=15)
-            ax.set_ylabel("PDF", fontsize=15)
-            ax.set_title(p)
-            ax.legend()
+                sub = df[(df["period"] == p) & (df["rurality"] == rur)].sort_values("bin_center")
+                if not sub.empty:
+                    ax.loglog(sub["bin_center"], sub["pdf"], linewidth=set_mpl.LINEWIDTH,
+                              color=rural2color[rur], label=rur)
+            ax.set_xlabel(r"$R_g$ (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+            ax.set_ylabel("PDF", fontsize=set_mpl.FONTSIZE_LABEL)
+#            ax.set_title(p, fontsize=set_mpl.FONTSIZE_TITLE)
+            ax.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
             plt.tight_layout()
-            plt.savefig(
-                self.dir_plot / f"rg_rurality_{self.np_}_t_{self.t_threshold}_{self.region}_{p}.png",
-                dpi=200,
-            )
+            set_mpl.save(fig,
+                self.dir_plot / f"rg_rurality_{self.np_}_t_{self.t_threshold}_{self.region}_{p}.png")
             plt.show()
 
     # ------------------------------------------------------------------
@@ -526,14 +598,9 @@ class plotter:
         return week2rg
 
     def plot_weekly_rg(self) -> None:
-        """Time series of average weekly RG with ±1σ band and period boundary lines."""
+        """Time series of average weekly RG with period boundary lines."""
         import matplotlib.dates as _mdates
         from datetime import datetime as _dt
-
-        week2rg = self._build_week2rg()
-        if not week2rg:
-            print("No weekly-RG data available.")
-            return
 
         def _parse_week(w: str):
             for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
@@ -543,37 +610,48 @@ class plotter:
                     pass
             return w
 
-        sorted_weeks = sorted(week2rg.keys(), key=_parse_week)
-        week_dates   = [_parse_week(w) for w in sorted_weeks]
-        avg_arr = np.array([np.nanmean(week2rg[w]) for w in sorted_weeks])
-        std_arr = np.array([np.nanstd(week2rg[w])  for w in sorted_weeks])
+        CACHE = "weekly_rg_timeseries"
+        df = self._load_cache(CACHE)
+        if df is None:
+            week2rg = self._build_week2rg()
+            if not week2rg:
+                print("No weekly-RG data available.")
+                return
+            rows = [
+                {"week": w, "mean_rg": float(np.nanmean(vals)),
+                 "std_rg": float(np.nanstd(vals))}
+                for w, vals in week2rg.items()
+            ]
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
+        if df.empty:
+            print("No weekly-RG data available.")
+            return
+
+        df = df.copy()
+        df["week_dt"] = df["week"].apply(_parse_week)
+        df = df.sort_values("week_dt")
 
         fig, ax = plt.subplots(figsize=(12, 5))
-        color = "steelblue"
-        ax.plot(week_dates, avg_arr, color=color, linewidth=2, marker="o", ms=4)
-        ax.fill_between(week_dates, avg_arr - std_arr, avg_arr + std_arr,
-                        alpha=0.25, color=color, label="±1σ")
-
-        # Period boundary vertical lines (inner boundaries only)
+        ax.plot(df["week_dt"], df["mean_rg"], color="steelblue",
+                linewidth=set_mpl.LINEWIDTH, marker="o", ms=4)
         for boundary in self.period_division[1:-1]:
-            ax.axvline(boundary, color="black", linestyle="--", linewidth=1, alpha=0.7)
-
+            ax.axvline(boundary, color="black", linestyle="--",
+                       linewidth=set_mpl.LINEWIDTH_THIN, alpha=0.7)
         ax.xaxis.set_major_formatter(_mdates.DateFormatter("%b %Y"))
         ax.xaxis.set_major_locator(_mdates.WeekdayLocator(interval=4))
-        plt.xticks(rotation=45, ha="right")
-        ax.set_xlabel("Week", fontsize=15)
-        ax.set_ylabel("Average Radius of Gyration (km)", fontsize=15)
-        ax.set_title("Weekly average radius of gyration")
-        ax.legend()
+        plt.xticks(rotation=45, ha="right", fontsize=set_mpl.FONTSIZE_TICK)
+        ax.set_xlabel("Week", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.set_ylabel(r"$\langle R_g \rangle$ (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+#        ax.set_title("Weekly average radius of gyration", fontsize=set_mpl.FONTSIZE_TITLE)
         plt.tight_layout()
-        plt.savefig(
-            self.dir_plot / f"weekly_rg_{self.np_}_t_{self.t_threshold}_{self.region}.png",
-            dpi=200,
-        )
+        set_mpl.save(fig,
+            self.dir_plot / f"weekly_rg_{self.np_}_t_{self.t_threshold}_{self.region}.png")
         plt.show()
 
     def plot_rg_rurality_weekly(self) -> None:
-        """Weekly avg RG ±1σ band, stratified by rurality, with period boundary lines."""
+        """Weekly avg RG stratified by rurality, with period boundary lines."""
         import matplotlib.dates as _mdates
         from datetime import datetime as _dt
 
@@ -587,52 +665,58 @@ class plotter:
                     pass
             return w
 
-        # Aggregate all weeks across all periods into one dict
-        all_weeks: dict = {}
-        for p in self.period_names:
-            rg_rural, _ = self._load_weekly_rg_stratified(p)
-            for week, strata in rg_rural.items():
-                all_weeks.setdefault(week, {r: [] for r in RURALITY_LEVELS})
-                for rur in RURALITY_LEVELS:
-                    all_weeks[week][rur].extend(strata.get(rur, []))
+        CACHE = "weekly_rg_by_rurality"
+        df = self._load_cache(CACHE)
+        if df is None:
+            all_weeks: dict = {}
+            for p in self.period_names:
+                rg_rural, _ = self._load_weekly_rg_stratified(p)
+                for week, strata in rg_rural.items():
+                    all_weeks.setdefault(week, {r: [] for r in RURALITY_LEVELS})
+                    for rur in RURALITY_LEVELS:
+                        all_weeks[week][rur].extend(strata.get(rur, []))
+            if not all_weeks:
+                print("No weekly rurality-RG data available.")
+                return
+            rows = [
+                {"week": w, "rurality": rur,
+                 "mean_rg": float(np.nanmean(all_weeks[w].get(rur, [float("nan")]))),
+                 "std_rg":  float(np.nanstd(all_weeks[w].get(rur, [0.0])))}
+                for w in all_weeks
+                for rur in RURALITY_LEVELS
+            ]
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
 
-        if not all_weeks:
+        if df.empty:
             print("No weekly rurality-RG data available.")
             return
 
-        sorted_weeks = sorted(all_weeks.keys(), key=_parse_week)
-        week_dates   = [_parse_week(w) for w in sorted_weeks]
-
+        sorted_weeks = sorted(df["week"].unique(), key=_parse_week)
         fig, ax = plt.subplots(figsize=(12, 5))
         for rur in RURALITY_LEVELS:
-            avg_arr = np.array([np.nanmean(all_weeks[w].get(rur, [float("nan")])) for w in sorted_weeks])
-            std_arr = np.array([np.nanstd(all_weeks[w].get(rur, [0.0])) for w in sorted_weeks])
-            valid   = np.isfinite(avg_arr)
-            d_valid = [d for d, v in zip(week_dates, valid) if v]
-            ax.plot(d_valid, avg_arr[valid], color=rural2color[rur], linewidth=2, label=rur)
-            ax.fill_between(d_valid,
-                            (avg_arr - std_arr)[valid],
-                            (avg_arr + std_arr)[valid],
-                            alpha=0.25, color=rural2color[rur])
-
+            sub = df[df["rurality"] == rur].set_index("week").reindex(sorted_weeks)
+            week_dts = [_parse_week(w) for w in sorted_weeks]
+            valid = np.isfinite(sub["mean_rg"].to_numpy())
+            ax.plot([d for d, v in zip(week_dts, valid) if v],
+                    sub["mean_rg"].to_numpy()[valid],
+                    color=rural2color[rur], linewidth=set_mpl.LINEWIDTH, label=rur)
         for boundary in self.period_division[1:-1]:
-            ax.axvline(boundary, color="black", linestyle="--", linewidth=1, alpha=0.7)
-
+            ax.axvline(boundary, color="black", linestyle="--",
+                       linewidth=set_mpl.LINEWIDTH_THIN, alpha=0.7)
         ax.xaxis.set_major_formatter(_mdates.DateFormatter("%b %Y"))
         ax.xaxis.set_major_locator(_mdates.WeekdayLocator(interval=4))
-        plt.xticks(rotation=45, ha="right")
-        ax.set_xlabel("Week", fontsize=15)
-        ax.set_ylabel("Radius of Gyration (km)", fontsize=15)
-        ax.legend()
+        plt.xticks(rotation=45, ha="right", fontsize=set_mpl.FONTSIZE_TICK)
+        ax.set_xlabel("Week", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.set_ylabel(r"$\langle R_g \rangle$ (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
         plt.tight_layout()
-        plt.savefig(
-            self.dir_plot / f"weekly_rg_rurality_{self.np_}_t_{self.t_threshold}_{self.region}.png",
-            dpi=200,
-        )
+        set_mpl.save(fig,
+            self.dir_plot / f"weekly_rg_rurality_{self.np_}_t_{self.t_threshold}_{self.region}.png")
         plt.show()
 
     def plot_rg_party_weekly(self) -> None:
-        """Weekly avg RG ±1σ band, stratified by political party, with period boundary lines."""
+        """Weekly avg RG stratified by political party, with period boundary lines."""
         import matplotlib.dates as _mdates
         from datetime import datetime as _dt
 
@@ -646,48 +730,162 @@ class plotter:
                     pass
             return w
 
-        # Aggregate all weeks across all periods
-        all_weeks: dict = {}
-        for p in self.period_names:
-            _, rg_party = self._load_weekly_rg_stratified(p)
-            for week, strata in rg_party.items():
-                all_weeks.setdefault(week, {pt: [] for pt in PARTY_NAMES})
-                for pt in PARTY_NAMES:
-                    all_weeks[week][pt].extend(strata.get(pt, []))
+        CACHE = "weekly_rg_by_party"
+        df = self._load_cache(CACHE)
+        if df is None:
+            all_weeks: dict = {}
+            for p in self.period_names:
+                _, rg_party = self._load_weekly_rg_stratified(p)
+                for week, strata in rg_party.items():
+                    all_weeks.setdefault(week, {pt: [] for pt in PARTY_NAMES})
+                    for pt in PARTY_NAMES:
+                        all_weeks[week][pt].extend(strata.get(pt, []))
+            if not all_weeks:
+                print("No weekly party-RG data available.")
+                return
+            rows = [
+                {"week": w, "party": pt,
+                 "mean_rg": float(np.nanmean(all_weeks[w].get(pt, [float("nan")]))),
+                 "std_rg":  float(np.nanstd(all_weeks[w].get(pt, [0.0])))}
+                for w in all_weeks
+                for pt in PARTY_NAMES
+            ]
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
 
-        if not all_weeks:
+        if df.empty:
             print("No weekly party-RG data available.")
             return
 
-        sorted_weeks = sorted(all_weeks.keys(), key=_parse_week)
-        week_dates   = [_parse_week(w) for w in sorted_weeks]
-
+        sorted_weeks = sorted(df["week"].unique(), key=_parse_week)
         fig, ax = plt.subplots(figsize=(12, 5))
         for party in PARTY_NAMES:
-            avg_arr = np.array([np.nanmean(all_weeks[w].get(party, [float("nan")])) for w in sorted_weeks])
-            std_arr = np.array([np.nanstd(all_weeks[w].get(party, [0.0])) for w in sorted_weeks])
-            valid   = np.isfinite(avg_arr)
-            d_valid = [d for d, v in zip(week_dates, valid) if v]
-            ax.plot(d_valid, avg_arr[valid], color=party2color[party], linewidth=2, label=party)
-            ax.fill_between(d_valid,
-                            (avg_arr - std_arr)[valid],
-                            (avg_arr + std_arr)[valid],
-                            alpha=0.25, color=party2color[party])
-
+            sub = df[df["party"] == party].set_index("week").reindex(sorted_weeks)
+            week_dts = [_parse_week(w) for w in sorted_weeks]
+            valid = np.isfinite(sub["mean_rg"].to_numpy())
+            ax.plot([d for d, v in zip(week_dts, valid) if v],
+                    sub["mean_rg"].to_numpy()[valid],
+                    color=party2color[party], linewidth=set_mpl.LINEWIDTH, label=party)
         for boundary in self.period_division[1:-1]:
-            ax.axvline(boundary, color="black", linestyle="--", linewidth=1, alpha=0.7)
-
+            ax.axvline(boundary, color="black", linestyle="--",
+                       linewidth=set_mpl.LINEWIDTH_THIN, alpha=0.7)
         ax.xaxis.set_major_formatter(_mdates.DateFormatter("%b %Y"))
         ax.xaxis.set_major_locator(_mdates.WeekdayLocator(interval=4))
-        plt.xticks(rotation=45, ha="right")
-        ax.set_xlabel("Week", fontsize=15)
-        ax.set_ylabel("Radius of Gyration (km)", fontsize=15)
-        ax.legend()
+        plt.xticks(rotation=45, ha="right", fontsize=set_mpl.FONTSIZE_TICK)
+        ax.set_xlabel("Week", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.set_ylabel(r"$\langle R_g \rangle$ (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
         plt.tight_layout()
-        plt.savefig(
-            self.dir_plot / f"weekly_rg_party_{self.np_}_t_{self.t_threshold}_{self.region}.png",
-            dpi=200,
+        set_mpl.save(fig,
+            self.dir_plot / f"weekly_rg_party_{self.np_}_t_{self.t_threshold}_{self.region}.png")
+        plt.show()
+
+    def plot_rg_weekly_combined(self) -> None:
+        """Rurality (top) and party (bottom) weekly avg RG in one figure, shared x-axis."""
+        import matplotlib.dates as _mdates
+        from datetime import datetime as _dt
+
+        rural2color = {"rural": "steelblue", "urban": "tomato"}
+        party2color = {"Democratic": "royalblue", "Republican": "firebrick"}
+
+        def _parse_week(w: str):
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+                try:
+                    return _dt.strptime(w, fmt)
+                except ValueError:
+                    pass
+            return w
+
+        # ── load / build rurality cache ──────────────────────────────
+        df_rur = self._load_cache("weekly_rg_by_rurality")
+        if df_rur is None:
+            all_weeks: dict = {}
+            for p in self.period_names:
+                rg_rural, _ = self._load_weekly_rg_stratified(p)
+                for week, strata in rg_rural.items():
+                    all_weeks.setdefault(week, {r: [] for r in RURALITY_LEVELS})
+                    for rur in RURALITY_LEVELS:
+                        all_weeks[week][rur].extend(strata.get(rur, []))
+            if not all_weeks:
+                print("No weekly rurality-RG data available.")
+                return
+            df_rur = pd.DataFrame([
+                {"week": w, "rurality": rur,
+                 "mean_rg": float(np.nanmean(all_weeks[w].get(rur, [float("nan")]))),
+                 "std_rg":  float(np.nanstd(all_weeks[w].get(rur, [0.0])))}
+                for w in all_weeks for rur in RURALITY_LEVELS
+            ])
+            self._save_cache(df_rur, "weekly_rg_by_rurality")
+
+        # ── load / build party cache ─────────────────────────────────
+        df_party = self._load_cache("weekly_rg_by_party")
+        if df_party is None:
+            all_weeks = {}
+            for p in self.period_names:
+                _, rg_party = self._load_weekly_rg_stratified(p)
+                for week, strata in rg_party.items():
+                    all_weeks.setdefault(week, {pt: [] for pt in PARTY_NAMES})
+                    for pt in PARTY_NAMES:
+                        all_weeks[week][pt].extend(strata.get(pt, []))
+            if not all_weeks:
+                print("No weekly party-RG data available.")
+                return
+            df_party = pd.DataFrame([
+                {"week": w, "party": pt,
+                 "mean_rg": float(np.nanmean(all_weeks[w].get(pt, [float("nan")]))),
+                 "std_rg":  float(np.nanstd(all_weeks[w].get(pt, [0.0])))}
+                for w in all_weeks for pt in PARTY_NAMES
+            ])
+            self._save_cache(df_party, "weekly_rg_by_party")
+
+        if df_rur.empty and df_party.empty:
+            print("No weekly RG data available.")
+            return
+
+        sorted_weeks_rur   = sorted(df_rur["week"].unique(),   key=_parse_week)
+        sorted_weeks_party = sorted(df_party["week"].unique(), key=_parse_week)
+
+        fig, (ax_rur, ax_party) = plt.subplots(
+            2, 1, figsize=(12, 9), sharex=True,
+            constrained_layout=True,
         )
+
+        # Top panel — rurality
+        for rur in RURALITY_LEVELS:
+            sub = df_rur[df_rur["rurality"] == rur].set_index("week").reindex(sorted_weeks_rur)
+            week_dts = [_parse_week(w) for w in sorted_weeks_rur]
+            valid = np.isfinite(sub["mean_rg"].to_numpy())
+            ax_rur.plot([d for d, v in zip(week_dts, valid) if v],
+                        sub["mean_rg"].to_numpy()[valid],
+                        color=rural2color[rur], linewidth=set_mpl.LINEWIDTH, label=rur)
+        for boundary in self.period_division[1:-1]:
+            ax_rur.axvline(boundary, color="black", linestyle="--",
+                           linewidth=set_mpl.LINEWIDTH_THIN, alpha=0.7)
+        ax_rur.set_ylabel(r"$\langle R_g \rangle$ (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax_rur.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
+
+        # Bottom panel — party
+        for party in PARTY_NAMES:
+            sub = df_party[df_party["party"] == party].set_index("week").reindex(sorted_weeks_party)
+            week_dts = [_parse_week(w) for w in sorted_weeks_party]
+            valid = np.isfinite(sub["mean_rg"].to_numpy())
+            ax_party.plot([d for d, v in zip(week_dts, valid) if v],
+                          sub["mean_rg"].to_numpy()[valid],
+                          color=party2color[party], linewidth=set_mpl.LINEWIDTH, label=party)
+        for boundary in self.period_division[1:-1]:
+            ax_party.axvline(boundary, color="black", linestyle="--",
+                             linewidth=set_mpl.LINEWIDTH_THIN, alpha=0.7)
+        ax_party.set_ylabel(r"$\langle R_g \rangle$ (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax_party.set_xlabel("Week", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax_party.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
+
+        ax_party.xaxis.set_major_formatter(_mdates.DateFormatter("%b %Y"))
+        ax_party.xaxis.set_major_locator(_mdates.WeekdayLocator(interval=4))
+        plt.setp(ax_party.get_xticklabels(), rotation=45, ha="right",
+                 fontsize=set_mpl.FONTSIZE_TICK)
+
+        set_mpl.save(fig,
+            self.dir_plot / f"weekly_rg_combined_{self.np_}_t_{self.t_threshold}_{self.region}.png")
         plt.show()
 
     # ------------------------------------------------------------------
@@ -695,116 +893,188 @@ class plotter:
     # ------------------------------------------------------------------
 
     def plot_krg(self) -> None:
-        """2-D histograms of RG vs k-RG for each k and period."""
+        """Grid of 2-D histograms: rows = periods (lockdown + post), columns = k values."""
         assert logHist is not None, "rg_histograms library not available"
-        nbins = 40
-        list_k = K_RADIUS_VALUES
-        period2krg = {
-            p: {f"rg_{k}": [] for k in list_k}
-            for p in self.period_names
-        }
-        for p in self.period_names[1:]:          # skip pre-lockdown baseline
-            df_all = self._load_scalars(p)
-            if df_all.empty:
-                continue
-            period2krg[p]["rg_1"] = df_all["radius_gyration"].dropna().tolist()
-            for k in list_k:
-                col = f"rg_{k}"
-                if col in df_all.columns:
-                    # k-RG is already in km (same as radius_gyration)
-                    period2krg[p][col] = df_all[col].dropna().tolist()
+        nbins    = 40
+        list_k   = K_RADIUS_VALUES
+        rg_range = [0.1, 1500.0]
 
-        for p in self.period_names[1:]:
-            rg1 = np.array(period2krg[p]["rg_1"])
-            for k in list_k:
-                rgk  = np.array(period2krg[p][f"rg_{k}"])
-                cond = (rg1 > 0.1) & (rgk > 0.1)
-                rg1f = rg1[cond]
-                rgkf = rgk[cond]
-                if len(rg1f) == 0:
+        CACHE = "k_radius_gyration_distribution"
+        df = self._load_cache(CACHE)
+        if df is None:
+            edges   = np.linspace(rg_range[0], rg_range[1], nbins + 1)
+            centers = 0.5 * (edges[:-1] + edges[1:])
+            rows = []
+            for p in self.period_names[1:]:
+                df_all = self._load_scalars(p)
+                if df_all.empty:
                     continue
-                fig, ax = plt.subplots(figsize=(8, 5))
-                plt.hist2d(
-                    rg1f, rgkf,
-                    bins=(nbins, nbins),
-                    range=[[0.1, 1500.0], [0.1, 1500.0]],
-                    density=True,
-                    cmap=plt.cm.jet,
-                    norm=mtl.colors.LogNorm(),
-                )
-                plt.colorbar()
-                ax.set_xlabel("Radius of Gyration (km)", fontsize=15)
-                ax.set_ylabel(f"{k}-Radius of Gyration (km)", fontsize=15)
-                ax.set_title(p)
-                plt.tight_layout()
-                plt.savefig(
-                    self.dir_plot / f"rg_krg_{p}_{self.np_}_t_{self.t_threshold}_k{k}_{self.region}.png",
-                    dpi=200,
-                )
-                plt.show()
+                rg_col = pd.to_numeric(df_all["radius_gyration"], errors="coerce").to_numpy()
+                for k in list_k:
+                    col = f"rg_{k}"
+                    if col not in df_all.columns:
+                        continue
+                    rgk_col = pd.to_numeric(df_all[col], errors="coerce").to_numpy()
+                    valid   = (np.isfinite(rg_col) & np.isfinite(rgk_col) &
+                               (rg_col > rg_range[0]) & (rgk_col > rg_range[0]))
+                    if not valid.any():
+                        continue
+                    H, _, _ = np.histogram2d(
+                        rg_col[valid], rgk_col[valid],
+                        bins=(nbins, nbins),
+                        range=[rg_range, rg_range],
+                        density=True,
+                    )
+                    H = H.T   # shape (nbins, nbins): row = y (k-Rg), col = x (Rg)
+                    for i, yc in enumerate(centers):
+                        for j, xc in enumerate(centers):
+                            rows.append({"period": p, "k": int(k),
+                                         "x_center": float(xc), "y_center": float(yc),
+                                         "density": float(H[i, j])})
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
+        periods  = self.period_names[1:]   # skip pre-lockdown baseline (no data yet)
+        n_rows  = len(periods)
+        n_cols  = len(list_k)
+        edges   = np.linspace(rg_range[0], rg_range[1], nbins + 1)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        Xm, Ym  = np.meshgrid(centers, centers)
+
+        # Reconstruct 2D arrays from the long-format cache via pivot
+        Hs: dict = {}
+        for p in periods:
+            for k in list_k:
+                sub = df[(df["period"] == p) & (df["k"] == k)]
+                if sub.empty:
+                    Hs[(p, k)] = None
+                    continue
+                H = (sub.sort_values(["y_center", "x_center"])["density"]
+                     .to_numpy()
+                     .reshape(nbins, nbins))
+                Hs[(p, k)] = H
+
+        all_pos = [H[H > 0].ravel() for H in Hs.values() if H is not None]
+        if not all_pos:
+            return
+        vmin_g  = min(v.min() for v in all_pos)
+        vmax_g  = max(v.max() for v in all_pos)
+        norm_sh = _mcolors.LogNorm(vmin=vmin_g, vmax=vmax_g)
+
+        fig, axes = plt.subplots(n_rows, n_cols,
+                                 figsize=(7 * n_cols, 6 * n_rows + 1),
+                                 sharex=True, sharey=True,
+                                 squeeze=False,
+                                 constrained_layout=True)
+
+        pcm_ref = None
+        for row_idx, p in enumerate(periods):
+            for col_idx, k in enumerate(list_k):
+                ax = axes[row_idx][col_idx]
+                H  = Hs.get((p, k))
+                if H is None:
+                    ax.set_visible(False)
+                    continue
+                pcm     = ax.pcolormesh(Xm, Ym, H, norm=norm_sh,
+                                        cmap=plt.cm.jet, shading="auto")
+                pcm_ref = pcm
+                if row_idx == 0:
+                    ax.set_title(rf"$k={k}$", fontsize=set_mpl.FONTSIZE_TITLE)
+                if col_idx == 0:
+                    ax.set_ylabel(p, fontsize=set_mpl.FONTSIZE_LABEL)
+                if row_idx == n_rows - 1:
+                    ax.set_xlabel(r"$R_g$ (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+
+        if pcm_ref is not None:
+            cbar = fig.colorbar(pcm_ref, ax=axes.ravel().tolist(),
+                                orientation="horizontal", location="bottom",
+                                fraction=0.03, pad=0.05)
+            cbar.set_label("Density", fontsize=set_mpl.FONTSIZE_LABEL)
+
+        set_mpl.save(fig,
+            self.dir_plot / f"rg_krg_{self.np_}_t_{self.t_threshold}_{self.region}.png")
+        plt.show()
 
     # ------------------------------------------------------------------
     # Distance
     # ------------------------------------------------------------------
 
     def plot_distance(self) -> None:
-        """Log-log PDF of total straight-line distance with power-law fit."""
+        """Log-log PDF of total haversine path length with power-law fit."""
         assert logHist is not None, "rg_histograms library required"
-        # Approximate distance-distribution exponents (alpha) per period.
-        # Used as fallback when the powerlaw library is unavailable.
         _ALPHA_FALLBACK = {
-            "15 jan - 15 march": 3.43,
-            "15 march - 15 may": 2.627,
-            "15 may - sept":     3.21,
-        }
-        _MAX_RG_KM = 20_037.0
-        period2dist = {p: [] for p in self.period_names}
-        for p in self.period_names:
-            df = self._load_scalars(p)
-            if not df.empty:
-                period2dist[p] = df["distance"].dropna().tolist()
+            self.period_names[0]: 3.4,
+            self.period_names[1]: 2.6,
+            self.period_names[2]: 3.3,
+        } if len(self.period_names) >= 3 else {}
+        _FILTER_KM = 0.01     # exclude zeros / near-zeros
+        _MAX_KM    = 20_037.0
+
+        CACHE = "distance_distribution_v2"
+        df = self._load_cache(CACHE)
+        if df is None:
+            rows = []
+            for p in self.period_names:
+                df_s = self._load_scalars(p)
+                if df_s.empty:
+                    continue
+                vals_all = pd.to_numeric(df_s["distance"], errors="coerce").dropna()
+                vals_all = vals_all[(vals_all > _FILTER_KM) & (vals_all < _MAX_KM)]
+                vals = vals_all.tolist()
+                if not vals:
+                    continue
+                q, a, _ = logHist(vals, 200)
+                alpha_v: float = _ALPHA_FALLBACK.get(p, 3.0)
+                sigma_v: float = float("nan")
+                xmin_fit: float = float(np.percentile(vals, 50))  # fallback: median
+                fraction: float = 1.0
+                if powerlaw is not None:
+                    try:
+                        fit      = powerlaw.Fit(vals)          # auto-select xmin
+                        alpha_v  = float(fit.power_law.alpha)
+                        sigma_v  = float(fit.power_law.sigma)
+                        xmin_fit = float(fit.power_law.xmin)
+                        fraction = float(np.sum(vals_all >= xmin_fit) / len(vals_all))
+                    except Exception:
+                        pass
+                for bc, pv in zip(a, q):
+                    rows.append({"period": p, "bin_center": float(bc), "pdf": float(pv),
+                                 "fit_alpha": alpha_v, "fit_sigma": sigma_v,
+                                 "fit_xmin": xmin_fit, "fit_fraction": fraction})
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
 
         fig, ax = plt.subplots(figsize=(8, 5))
-        legend_items = []
         colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
         for idx, p in enumerate(self.period_names):
-            vals = [v for v in period2dist[p] if 0.1 < v < _MAX_RG_KM]
-            if not vals:
+            sub = df[df["period"] == p].sort_values("bin_center")
+            if sub.empty:
                 continue
-            q, a, _ = logHist(vals, 200)
-            ax.scatter(a, q, linewidth=3)
-            ax.set_yscale("log")
-            ax.set_xscale("log")
-            color = colors[idx % len(colors)]
-            if powerlaw is not None:
-                try:
-                    fit   = powerlaw.Fit(vals)
-                    alpha = fit.power_law.alpha
-                    sigma = fit.power_law.sigma
-                    fit.power_law.plot_pdf(
-                        color=color, linestyle="--", linewidth=3, ax=ax,
-                    )
-                    legend_items += [rf"$\alpha$ = {alpha:.3f} $\pm$ {sigma:.3f}", p]
-                except Exception:
-                    alpha = _ALPHA_FALLBACK.get(p, 3.0)
-                    x_fit = np.logspace(np.log10(min(vals)), np.log10(max(vals)), 200)
-                    ax.loglog(x_fit, x_fit ** (-alpha) * x_fit[0] ** alpha * q[0],
-                              color=color, linestyle="--", linewidth=3)
-                    legend_items += [rf"$\alpha$ ≈ {alpha:.3f} (fallback)", p]
+            color    = colors[idx % len(colors)]
+            alpha_v  = float(sub["fit_alpha"].iloc[0])
+            sigma_v  = float(sub["fit_sigma"].iloc[0])
+            xmin     = float(sub["fit_xmin"].iloc[0])
+            fraction = float(sub["fit_fraction"].iloc[0]) if "fit_fraction" in sub.columns else 1.0
+            ax.scatter(sub["bin_center"], sub["pdf"], s=20, color=color)
+            # Scale the power-law line so it integrates to `fraction` over [xmin, ∞),
+            # matching the empirical histogram normalized over all data.
+            x_fit = np.logspace(np.log10(xmin), np.log10(sub["bin_center"].max()), 200)
+            C     = fraction * (alpha_v - 1) * xmin ** (alpha_v - 1)
+            if np.isfinite(sigma_v):
+                lbl = rf"$\alpha$ = {alpha_v:.3f} $\pm$ {sigma_v:.3f}"
             else:
-                alpha = _ALPHA_FALLBACK.get(p, 3.0)
-                x_fit = np.logspace(np.log10(min(vals)), np.log10(max(vals)), 200)
-                ax.loglog(x_fit, x_fit ** (-alpha) * x_fit[0] ** alpha * q[0],
-                          color=color, linestyle="--", linewidth=3)
-                legend_items += [rf"$\alpha$ ≈ {alpha:.3f} (preset)", p]
-        ax.set_xlabel("Distance (km)", fontsize=15)
-        ax.set_ylabel("PDF", fontsize=15)
-        ax.legend(legend_items)
+                lbl = rf"$\alpha$ ≈ {alpha_v:.3f} (preset)"
+            ax.loglog(x_fit, C * x_fit ** (-alpha_v),
+                      color=color, linestyle="--", linewidth=set_mpl.LINEWIDTH,
+                      label=lbl)
+        ax.set_xscale("log")
+        ax.set_yscale("log")
+        ax.set_xlabel("Distance (km)", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.set_ylabel("PDF", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
         plt.tight_layout()
-        plt.savefig(
-            self.dir_plot / f"distance_{self.np_}_t_{self.t_threshold}_{self.region}.png",
-            dpi=200,
-        )
+        set_mpl.save(fig,
+            self.dir_plot / f"distance_{self.np_}_t_{self.t_threshold}_{self.region}.png")
         plt.show()
 
     # ------------------------------------------------------------------
@@ -812,94 +1082,156 @@ class plotter:
     # ------------------------------------------------------------------
 
     def plot_entropy(self) -> None:
-        """PDF for each of the three entropy types across periods."""
+        """Single figure with 4 panels: random, uncorrelated, real, and scaled (real/random) entropy."""
         assert logHist is not None, "rg_histograms library not available"
-        for etype in ["random_entropy", "uncorrelated_entropy", "real_entropy"]:
-            period2ent = {p: [] for p in self.period_names}
+
+        ETYPES = ["random_entropy", "uncorrelated_entropy", "real_entropy", "scaled_entropy"]
+        CACHE  = "entropy_distributions"
+
+        df = self._load_cache(CACHE)
+        # Recompute if cache is absent or doesn't yet contain the scaled entropy rows
+        if df is None or "scaled_entropy" not in df["entropy_type"].values:
+            etype_bins = {
+                "random_entropy": 12,
+                "uncorrelated_entropy": 200,
+                "real_entropy": 200,
+                "scaled_entropy": 200,
+            }
+            rows = []
             for p in self.period_names:
-                df = self._load_scalars(p)
-                if not df.empty and etype in df.columns:
-                    period2ent[p] = df[etype].dropna().tolist()
-            fig, ax = plt.subplots(figsize=(8, 5))
+                df_s = self._load_scalars(p)
+                if df_s.empty:
+                    continue
+                raw: dict = {et: [] for et in etype_bins}
+                for etype in ["random_entropy", "uncorrelated_entropy", "real_entropy"]:
+                    if etype in df_s.columns:
+                        raw[etype] = df_s[etype].dropna().tolist()
+                if "real_entropy" in df_s.columns and "random_entropy" in df_s.columns:
+                    paired = df_s[["real_entropy", "random_entropy"]].dropna()
+                    paired = paired[paired["random_entropy"] > 0]
+                    raw["scaled_entropy"] = [
+                        float(r["real_entropy"] / r["random_entropy"])
+                        for _, r in paired.iterrows()
+                    ]
+                for etype, vals in raw.items():
+                    if not vals:
+                        continue
+                    q, a, _ = logHist(vals, etype_bins[etype])
+                    for bc, pv in zip(a, q):
+                        rows.append({"period": p, "entropy_type": etype,
+                                     "bin_center": float(bc), "pdf": float(pv)})
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
+        etype_xlabel = {
+            "random_entropy":       "Random entropy",
+            "uncorrelated_entropy": "Uncorrelated entropy",
+            "real_entropy":         "Real entropy",
+            "scaled_entropy":       r"Real / Random entropy",
+        }
+
+        fig, axes = plt.subplots(2, 2,
+                                 figsize=(16, 10),
+                                 squeeze=False)
+        for idx, etype in enumerate(ETYPES):
+            ax = axes[idx // 2][idx % 2]
             for p in self.period_names:
-                bins = 12 if etype == "random_entropy" else 200
-                q, a, _ = logHist(period2ent[p], bins)
-                ax.plot(a, q, linewidth=4)
-            ax.set_xlabel(etype.replace("_", " ").title(), fontsize=15)
-            ax.set_ylabel("PDF", fontsize=15)
-            ax.legend(self.period_names)
-            plt.tight_layout()
-            plt.savefig(
-                self.dir_plot / f"{etype}_{self.region}.png", dpi=200
-            )
-            plt.show()
+                sub = df[
+                    (df["period"] == p) & (df["entropy_type"] == etype)
+                ].sort_values("bin_center")
+                if sub.empty:
+                    continue
+                ax.plot(sub["bin_center"], sub["pdf"], linewidth=set_mpl.LINEWIDTH)
+            ax.set_xlabel(etype_xlabel[etype], fontsize=set_mpl.FONTSIZE_LABEL)
+            if idx % 2 == 0:
+                ax.set_ylabel("PDF", fontsize=set_mpl.FONTSIZE_LABEL)
+            ax.legend(self.period_names, fontsize=12)
+        plt.tight_layout()
+        set_mpl.save(fig,
+            self.dir_plot / f"entropy_{self.np_}_t_{self.t_threshold}_{self.region}.png")
+        plt.show()
 
     # ------------------------------------------------------------------
     # S(t) exploration curve
     # ------------------------------------------------------------------
 
     def plot_St(self) -> None:
-        """S(t) scatter with ±1σ band and power-law fit per period."""
-        # Approximate exploration exponents (mu) per period as starting estimates
-        # or fallback when power_fit is unavailable.
+        """S(t) scatter with power-law fit per period (no error band)."""
+        # Approximate exploration exponents (mu) per period as fallback estimates.
         _MU_FALLBACK = {
-            "15 jan - 15 march": 0.668,
-            "15 march - 15 may": 0.523,
-            "15 may - sept":     0.668,
-        }
+            self.period_names[0]: 0.668,
+            self.period_names[1]: 0.523,
+            self.period_names[2]: 0.668,
+        } if len(self.period_names) >= 3 else {}
+
+        CACHE = "st_exploration_curve"
+        df = self._load_cache(CACHE)
+        if df is None:
+            MAX_PEOPLE = 400_000
+            rows = []
+            for p in self.period_names:
+                period2St = self._load_st_dict(p, max_people=MAX_PEOPLE)
+                if not period2St:
+                    continue
+                for t_step in sorted(period2St):
+                    vals = period2St[t_step]
+                    rows.append({
+                        "period":   p,
+                        "time_step": int(t_step),
+                        "mean_st":  float(np.nanmean(vals)),
+                        "std_st":   float(np.nanstd(vals)),
+                    })
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
         fig, ax = plt.subplots(figsize=(8, 5))
-        legend_items = []
-        MAX_PEOPLE = 400_000
         colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
         for idx, p in enumerate(self.period_names):
-            period2St = self._load_st_dict(p, max_people=MAX_PEOPLE)
-            if not period2St:
+            sub = df[df["period"] == p].sort_values("time_step")
+            if sub.empty:
                 continue
-
-            sorted_keys = sorted(period2St)
-            l_mean = np.array([np.nanmean(period2St[h]) for h in sorted_keys])
-            l_std  = np.array([np.nanstd(period2St[h])  for h in sorted_keys])
+            l_mean = sub["mean_st"].to_numpy()
+            t_arr  = np.arange(len(l_mean))
             mask   = np.isfinite(l_mean)
             l_mean = l_mean[mask]
-            l_std  = l_std[mask]
-            t_arr  = np.arange(len(l_mean))
+            t_arr  = t_arr[mask]
 
             color = colors[idx % len(colors)]
-            ax.scatter(t_arr, l_mean, s=20, alpha=0.6, color=color)
-            ax.fill_between(t_arr,
-                            np.maximum(l_mean - l_std, 1e-6),
-                            l_mean + l_std,
-                            alpha=0.2, color=color)
+            ax.scatter(t_arr, l_mean, s=20, alpha=set_mpl.ALPHA_SIM, color=color)
 
             # Power-law fit
             if power_fit is not None:
                 try:
                     slope, std_err, _r, _i = power_fit(t_arr, l_mean)
                     u_spacing = t_arr ** slope
-                    ax.loglog(t_arr[10:], u_spacing[10:], linestyle="dashed", color=color)
-                    legend_items += [rf"$\mu$ = {slope:.3f} $\pm$ {std_err:.3f}", p]
+                    ax.loglog(t_arr[10:], u_spacing[10:],
+                              linestyle="dashed", color=color,
+                              linewidth=set_mpl.LINEWIDTH,
+                              label=rf"$\mu$ = {slope:.3f} $\pm$ {std_err:.3f}")
                 except Exception:
                     mu_fb = _MU_FALLBACK.get(p, 0.6)
                     u_spacing = t_arr ** mu_fb
-                    ax.loglog(t_arr[10:], u_spacing[10:], linestyle="dashed", color=color)
-                    legend_items += [rf"$\mu$ ≈ {mu_fb:.3f} (fallback)", p]
+                    ax.loglog(t_arr[10:], u_spacing[10:],
+                              linestyle="dashed", color=color,
+                              linewidth=set_mpl.LINEWIDTH,
+                              label=rf"$\mu$ ≈ {mu_fb:.3f} (fallback)")
             else:
                 mu_fb = _MU_FALLBACK.get(p, 0.6)
                 u_spacing = t_arr ** mu_fb
-                ax.loglog(t_arr[10:], u_spacing[10:], linestyle="dashed", color=color)
-                legend_items += [rf"$\mu$ ≈ {mu_fb:.3f} (preset)", p]
+                ax.loglog(t_arr[10:], u_spacing[10:],
+                          linestyle="dashed", color=color,
+                          linewidth=set_mpl.LINEWIDTH,
+                          label=rf"$\mu$ ≈ {mu_fb:.3f} (preset)")
 
-        ax.set_xlabel("t (h)", fontsize=15)
-        ax.set_ylabel("S(t)", fontsize=15)
+        ax.set_xlabel("t (h)", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.set_ylabel("S(t)", fontsize=set_mpl.FONTSIZE_LABEL)
         ax.set_xscale("log")
         ax.set_yscale("log")
-        ax.legend(legend_items)
+        ax.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
         plt.tight_layout()
-        plt.savefig(
-            self.dir_plot / f"St_{self.np_}_t_{self.t_threshold}_{self.region}.png",
-            dpi=200,
-        )
+        set_mpl.save(fig,
+            self.dir_plot / f"St_{self.np_}_t_{self.t_threshold}_{self.region}.png")
         plt.show()
 
     # ------------------------------------------------------------------
@@ -909,35 +1241,50 @@ class plotter:
     def plot_frequency(self) -> None:
         """Bar chart of average location frequency by rank (top 9)."""
         max_rank = 9
-        Period2Rank = {
-            p: self._load_frequency_by_rank(p, max_rank=max_rank)
-            for p in self.period_names
-        }
 
-        df_avg = pd.DataFrame(
-            {
-                p: [np.mean(Period2Rank[p][r]) for r in range(1, max_rank + 1)]
-                for p in self.period_names
-            }
-        )
+        CACHE = "location_frequency_by_rank"
+        df = self._load_cache(CACHE)
+        if df is None:
+            rows = []
+            for p in self.period_names:
+                freq = self._load_frequency_by_rank(p, max_rank=max_rank)
+                for r in range(1, max_rank + 1):
+                    vals = freq.get(r, [])
+                    if vals:
+                        rows.append({"period": p, "rank": r,
+                                     "mean_frequency": float(np.mean(vals))})
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
         x   = np.arange(max_rank)
         w   = 0.3
         fig, ax = plt.subplots(figsize=(8, 5))
         for idx, p in enumerate(self.period_names):
-            ax.bar(x + idx * w, df_avg[p], width=w, label=p, edgecolor="black")
-        ax.set_xlabel("Rank", fontsize=15)
-        ax.set_ylabel(r"$\langle k \rangle$", fontsize=15)
-        ax.legend()
+            sub = df[df["period"] == p].sort_values("rank")
+            vals = sub["mean_frequency"].tolist()
+            ax.bar(x[:len(vals)] + idx * w, vals, width=w, label=p, edgecolor="black")
+        ax.set_xlabel("Rank", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.set_ylabel(r"$\langle k \rangle$", fontsize=set_mpl.FONTSIZE_LABEL)
+        ax.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
         plt.tight_layout()
-        plt.savefig(
-            self.dir_plot / f"frequency_rank_{self.np_}_t_{self.t_threshold}_{self.region}.png",
-            dpi=200,
-        )
+        set_mpl.save(fig,
+            self.dir_plot / f"frequency_rank_{self.np_}_t_{self.t_threshold}_{self.region}.png")
         plt.show()
 
     # ------------------------------------------------------------------
     # Gonzalez trajectory shape
     # ------------------------------------------------------------------
+
+    def _load_gonzalez_all_raw(self) -> pd.DataFrame:
+        """Load raw per-user gonzalez data for all periods (used to build plot caches)."""
+        rows = []
+        for p in self.period_names:
+            x, y, sx, sy = self._load_gonzalez(p)
+            for xv, yv, sxv, syv in zip(x, y, sx, sy):
+                rows.append({"period": p,
+                             "x_norm": float(xv), "y_norm": float(yv),
+                             "sigmax": float(sxv), "sigmay": float(syv)})
+        return pd.DataFrame(rows)
 
     def plot_gonzalez(
         self,
@@ -945,51 +1292,138 @@ class plotter:
         ymin: float = -2.2, ymax: float = 2.2,
         nbins: int = 40,
     ) -> None:
-        """2-D log-colourmap of normalised trajectory shape."""
+        """2-row grid per period: top row = 2-D density map, bottom row = profile at y/σ_y = 0."""
+        CACHE = "gonzalez_2d"
+        df = self._load_cache(CACHE)
+        if df is None:
+            raw  = self._load_gonzalez_all_raw()
+            x_edges   = np.linspace(xmin, xmax, nbins + 1)
+            y_edges   = np.linspace(ymin, ymax, nbins + 1)
+            x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+            y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+            rows = []
+            for p in self.period_names:
+                sub  = raw[raw["period"] == p]
+                x    = sub["x_norm"].to_numpy()
+                y    = sub["y_norm"].to_numpy()
+                mask = np.isfinite(x) & np.isfinite(y)
+                H, _, _ = np.histogram2d(x[mask], y[mask], bins=(nbins, nbins),
+                                         range=[[xmin, xmax], [ymin, ymax]])
+                H = H.T   # shape (nbins_y, nbins_x)
+                for i, yc in enumerate(y_centers):
+                    for j, xc in enumerate(x_centers):
+                        rows.append({"period": p,
+                                     "x_center": float(xc), "y_center": float(yc),
+                                     "density": float(H[i, j])})
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
+        n_periods = len(self.period_names)
+        x_edges   = np.linspace(xmin, xmax, nbins + 1)
+        y_edges   = np.linspace(ymin, ymax, nbins + 1)
+        x_centers = 0.5 * (x_edges[:-1] + x_edges[1:])
+        y_centers = 0.5 * (y_edges[:-1] + y_edges[1:])
+        X, Y = np.meshgrid(x_centers, y_centers)
+
+        # Rebuild 2D arrays from cache and determine shared colour scale
+        Hs = []
         for p in self.period_names:
-            x, y, _, _ = self._load_gonzalez(p)
-            X, Y = np.meshgrid(
-                np.linspace(xmin, xmax, nbins),
-                np.linspace(ymin, ymax, nbins),
-            )
-            H, _, _ = np.histogram2d(x, y, bins=(nbins, nbins),
-                                      range=[[xmin, xmax], [ymin, ymax]])
-            H = H.T
-            fig, ax = plt.subplots(figsize=(8, 5))
-            pcm = ax.pcolormesh(
-                X, Y, H, norm=mtl.colors.LogNorm(),
-                cmap=plt.cm.jet, shading="auto",
-            )
-            fig.colorbar(pcm).set_label("Number of points")
-            ax.set_xlabel(r"$x / \sigma_x$", fontsize=15)
-            ax.set_ylabel(r"$y / \sigma_y$", fontsize=15)
-            ax.set_title(p)
-            plt.tight_layout()
-            plt.savefig(
-                self.dir_plot / f"gonzalez_{p}_{self.np_}_t_{self.t_threshold}_{self.region}.png",
-                dpi=200,
-            )
-            plt.show()
+            sub = df[df["period"] == p].sort_values(["y_center", "x_center"])
+            H   = sub["density"].to_numpy().reshape(nbins, nbins)
+            Hs.append(H)
+
+        pos_vals = [H[H > 0] for H in Hs]
+        vmin_g   = min(v.min() for v in pos_vals if len(v)) if pos_vals else 1
+        vmax_g   = max(H.max() for H in Hs if H.max() > 0)
+        norm_sh  = _mcolors.LogNorm(vmin=vmin_g, vmax=vmax_g)
+
+        fig, axes = plt.subplots(
+            2, n_periods,
+            figsize=(8 * n_periods, 12),
+            sharex=True, sharey="row",
+            squeeze=False,
+        )
+
+        pcm_ref = None
+        for idx, (p, H) in enumerate(zip(self.period_names, Hs)):
+            ax_2d      = axes[0][idx]
+            ax_profile = axes[1][idx]
+
+            # ── 2D density map ──
+            pcm     = ax_2d.pcolormesh(X, Y, H, norm=norm_sh,
+                                       cmap=plt.cm.jet, shading="auto")
+            pcm_ref = pcm
+            ax_2d.set_title(p, fontsize=set_mpl.FONTSIZE_TITLE)
+            if idx == 0:
+                ax_2d.set_ylabel(r"$y / \sigma_y$", fontsize=set_mpl.FONTSIZE_LABEL)
+
+            # ── Profile at y/σ_y ≈ 0 (middle y-bin) ──
+            profile             = H[nbins // 2].astype(float)
+            profile[profile == 0] = np.nan
+            ax_profile.semilogy(x_centers, profile, linewidth=set_mpl.LINEWIDTH)
+            ax_profile.set_xlabel(r"$x / \sigma_x$", fontsize=set_mpl.FONTSIZE_LABEL)
+            if idx == 0:
+                ax_profile.set_ylabel(
+                    r"$\Phi\!\left(\frac{x}{\sigma_x}\,\middle|\,\frac{y}{\sigma_y}=0\right)$",
+                    fontsize=set_mpl.FONTSIZE_LABEL,
+                )
+
+        # Single shared colorbar for all 2-D panels
+        cbar = fig.colorbar(pcm_ref, ax=axes[0].ravel().tolist(),
+                            fraction=0.02, pad=0.04)
+        cbar.set_label("Count", fontsize=set_mpl.FONTSIZE_LABEL)
+
+        plt.tight_layout()
+        set_mpl.save(fig,
+            self.dir_plot / f"gonzalez_{self.np_}_t_{self.t_threshold}_{self.region}.png")
+        plt.show()
 
     def plot_sigmaxy(self) -> None:
-        """Log-log PDF of σ_x and σ_y per period."""
+        """Grid of σ_x / σ_y PDFs (one panel per period)."""
         assert logHist is not None, "rg_histograms library not available"
-        for p in self.period_names:
-            _, _, sx, sy = self._load_gonzalez(p)
-            fig, ax = plt.subplots(figsize=(8, 5))
-            q, a, _ = logHist([v for v in sx if v > 100], 150)
-            ax.loglog(a, q, linewidth=3, color="m", label=r"$\sigma_x$")
-            q1, a1, _ = logHist([v for v in sy if v > 100], 150)
-            ax.loglog(a1, q1, linewidth=3, color="c", label=r"$\sigma_y$")
-            ax.set_xlabel(r"$\sigma$ (m)", fontsize=15)
-            ax.set_ylabel("PDF", fontsize=15)
-            ax.legend()
-            plt.tight_layout()
-            plt.savefig(
-                self.dir_plot / f"sigmaxy_{p}_{self.np_}_t_{self.t_threshold}_{self.region}.png",
-                dpi=200,
-            )
-            plt.show()
+
+        CACHE = "sigmaxy_distributions"
+        df = self._load_cache(CACHE)
+        if df is None:
+            raw  = self._load_gonzalez_all_raw()
+            rows = []
+            for p in self.period_names:
+                sub = raw[raw["period"] == p]
+                for axis, col in [("sigma_x", "sigmax"), ("sigma_y", "sigmay")]:
+                    vals = [v for v in sub[col].tolist() if v > 100]
+                    if not vals:
+                        continue
+                    q, a, _ = logHist(vals, 150)
+                    for bc, pv in zip(a, q):
+                        rows.append({"period": p, "axis": axis,
+                                     "bin_center": float(bc), "pdf": float(pv)})
+            df = pd.DataFrame(rows)
+            self._save_cache(df, CACHE)
+
+        n_periods = len(self.period_names)
+        axis2color = {"sigma_x": "m", "sigma_y": "c"}
+        axis2label = {"sigma_x": r"$\sigma_x$", "sigma_y": r"$\sigma_y$"}
+        fig, axes = plt.subplots(1, n_periods,
+                                 figsize=(8 * n_periods, 5),
+                                 sharex=True, sharey=True,
+                                 squeeze=False)
+        for idx, p in enumerate(self.period_names):
+            ax = axes[0][idx]
+            for axis in ["sigma_x", "sigma_y"]:
+                sub = df[(df["period"] == p) & (df["axis"] == axis)].sort_values("bin_center")
+                if not sub.empty:
+                    ax.loglog(sub["bin_center"], sub["pdf"],
+                              linewidth=set_mpl.LINEWIDTH,
+                              color=axis2color[axis], label=axis2label[axis])
+            ax.set_xlabel(r"$\sigma$ (m)", fontsize=set_mpl.FONTSIZE_LABEL)
+            if idx == 0:
+                ax.set_ylabel("PDF", fontsize=set_mpl.FONTSIZE_LABEL)
+            ax.set_title(p, fontsize=set_mpl.FONTSIZE_TITLE)
+            ax.legend(fontsize=set_mpl.FONTSIZE_LEGEND)
+        plt.tight_layout()
+        set_mpl.save(fig,
+            self.dir_plot / f"sigmaxy_{self.np_}_t_{self.t_threshold}_{self.region}.png")
+        plt.show()
 
     # ------------------------------------------------------------------
     # Gap-analysis bridge methods (delegate to gap_analysis_plots.py)

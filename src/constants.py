@@ -214,7 +214,7 @@ SCALAR_METRICS_FLOAT: list[str] = [
     "random_entropy",         # S_rand — Boltzmann entropy of visits
     "uncorrelated_entropy",   # S_unc  — entropy ignoring temporal order
     "real_entropy",           # S_real — true entropy of trajectory
-    "distance",               # mean inter-stop distance [km]
+    "distance",               # total haversine path length [km] (sum of inter-stop distances)
     "q",                      # predictability limit
 ] + [f"rg_{k}" for k in K_RADIUS_VALUES]   # rg_3, rg_6, rg_10
 

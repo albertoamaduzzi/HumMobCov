@@ -19,8 +19,8 @@ import pandas as pd
 
 def setup():
     """Apply project-wide matplotlib/seaborn defaults."""
-    sns.set_style("whitegrid")
-    plt.rcParams["axes.grid"] = True
+    sns.set_style("white")
+    plt.rcParams["axes.grid"] = False
     pd.set_option("display.max_rows", 100)
     warnings.filterwarnings("ignore")
 
@@ -37,9 +37,9 @@ DPI = 200
 # ---------------------------------------------------------------------------
 
 FONTSIZE_TITLE  = 25   # ax.set_title(...)
-FONTSIZE_LABEL  = 25   # ax.set_xlabel / set_ylabel
-FONTSIZE_TICK   = 20   # set_xticklabels / set_yticklabels
-FONTSIZE_LEGEND = 20   # ax.legend(fontsize=...)
+FONTSIZE_LABEL  = 24   # ax.set_xlabel / set_ylabel
+FONTSIZE_TICK   = 22   # set_xticklabels / set_yticklabels
+FONTSIZE_LEGEND = 18   # ax.legend(fontsize=...)
 FONTSIZE_CBAR   = 25   # colorbar tick / label
 
 
